@@ -19,6 +19,7 @@ import fs from 'fs';
 import { execSync } from 'child_process';
 import { getAllSystems, systemExists, getSystemMeta } from '../reader/system-reader.js';
 import { getSystemTracks } from '../reader/lesson-reader.js';
+import { syncSystemFromRegistry, fetchRegistry } from '../reader/index.js';
 import { scaffoldProject } from '../scaffold/index.js';
 import { getCachedUser } from '../auth/index.js';
 import { markInProgress } from '../actions/progress.js';
@@ -59,31 +60,44 @@ export default function Init({ args, options }: Props) {
   const [phase, setPhase] = useState<InitPhase>({ name: 'loading' });
 
   useEffect(() => {
-    // Check dependencies first
-    const missing = checkDependencies();
-    if (missing.length > 0) {
-      setPhase({ name: 'error', message: `Missing dependencies: ${missing.join(', ')}. Install them and try again.` });
-      return;
-    }
+    (async () => {
+      // Check dependencies first
+      const missing = checkDependencies();
+      if (missing.length > 0) {
+        setPhase({ name: 'error', message: `Missing dependencies: ${missing.join(', ')}. Install them and try again.` });
+        return;
+      }
 
-    if (systemSlug) {
-      // Direct mode — check if system has tracks, then scaffold
-      if (!systemExists(systemSlug)) {
-        setPhase({ name: 'error', message: `System "${systemSlug}" not found.` });
-        return;
+      // Sync systems from registry (best-effort)
+      try {
+        const registry = await fetchRegistry();
+        if (registry.systems) {
+          for (const sys of registry.systems) {
+            try { await syncSystemFromRegistry(sys.slug, sys.repo); } catch {}
+          }
+        }
+      } catch {}
+
+      // Now proceed with normal flow
+      if (systemSlug) {
+        // Direct mode — check if system has tracks, then scaffold
+        if (!systemExists(systemSlug)) {
+          setPhase({ name: 'error', message: `System "${systemSlug}" not found.` });
+          return;
+        }
+        const tracks = getSystemTracks(systemSlug);
+        if (tracks.length === 0) {
+          setPhase({ name: 'error', message: `No tracks found for system "${systemSlug}".` });
+          return;
+        }
+        // Use first track by default in direct mode
+        const track = tracks[0];
+        doScaffold(systemSlug, track.slug, track.language, options.output, options.author, setPhase);
+      } else {
+        // Interactive mode — start with system picker
+        setPhase({ name: 'pick-system' });
       }
-      const tracks = getSystemTracks(systemSlug);
-      if (tracks.length === 0) {
-        setPhase({ name: 'error', message: `No tracks found for system "${systemSlug}".` });
-        return;
-      }
-      // Use first track by default in direct mode
-      const track = tracks[0];
-      doScaffold(systemSlug, track.slug, track.language, options.output, options.author, setPhase);
-    } else {
-      // Interactive mode — start with system picker
-      setPhase({ name: 'pick-system' });
-    }
+    })();
   }, []);
 
   // ─── Phase renders ─────────────────────────────────────────────
