@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execaSync } from 'execa';
+import { execa } from 'execa';
 
 // ─── Paths ──────────────────────────────────────────────────────────
 
@@ -118,7 +118,7 @@ export async function syncSystemFromRegistry(slug: string, repoUrl: string): Pro
   const cloneUrl = `https://${repoUrl}`.replace(/^https:\/\/https:\/\//, 'https://');
 
   try {
-    await execaSync('git', ['clone', '--depth=1', cloneUrl, targetDir], {
+    await execa('git', ['clone', '--depth=1', cloneUrl, targetDir], {
       timeout: 60_000,
       stdio: 'pipe',
     });
@@ -136,19 +136,37 @@ export async function fetchRegistry(): Promise<any> {
   const https = await import('https');
 
   return new Promise((resolve, reject) => {
-    https.get(REGISTRY_URL, (res) => {
+    const TIMEOUT = 15_000;
+    const opts = { headers: { 'User-Agent': '100xSystems-CLI/1.0' }, timeout: TIMEOUT };
+
+    const handleResponse = (res: any, resolveFn: (v: any) => void, rejectFn: (e: Error) => void) => {
+      let body = '';
+      res.on('data', (chunk: string) => body += chunk);
+      res.on('end', () => {
+        try { resolveFn(JSON.parse(body)); } catch { rejectFn(new Error('Failed to parse registry JSON')); }
+      });
+    };
+
+    const req = https.get(REGISTRY_URL, opts, (res) => {
+      // Handle GitHub redirects (raw.githubusercontent.com may redirect)
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // Follow the redirect — don't consume the original response
+        res.destroy();
+        const redirReq = https.get(res.headers.location, opts, (res2) => {
+          handleResponse(res2, resolve, reject);
+        });
+        redirReq.on('error', reject);
+        redirReq.setTimeout(TIMEOUT, () => { redirReq.destroy(new Error('Registry request timed out')); });
+        return;
+      }
       if (res.statusCode !== 200) {
         reject(new Error(`Registry responded with ${res.statusCode}`));
         return;
       }
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch (e) {
-          reject(new Error('Failed to parse registry JSON'));
-        }
-      });
-    }).on('error', reject);
+      handleResponse(res, resolve, reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(TIMEOUT, () => { req.destroy(new Error('Registry request timed out')); });
   });
 }
 
