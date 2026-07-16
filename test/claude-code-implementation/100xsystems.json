@@ -1,0 +1,17 @@
+{
+  "_project": "100xsystems",
+  "_description": "This file is managed by the 100xSystems CLI (https://github.com/100xsystems/100xsystems). It tracks your learning progress through systems engineering curriculum. Do not edit manually — use 100xsystems commands instead.",
+  "system": "claude-code",
+  "systemTitle": "Claude Code",
+  "track": "track-typescript",
+  "author": "aryanbatras",
+  "version": "0.1.0",
+  "createdAt": "2026-07-16T10:47:16.142Z",
+  "progress": {
+    "completedLessons": [
+      "lesson-intro-and-setup",
+      "lesson-build-cli-tool"
+    ],
+    "currentLesson": "lesson-agent-loop"
+  }
+}

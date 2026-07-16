@@ -1,0 +1,48 @@
+{
+  "name": "@100xsystems/cli",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "CLI for 100xSystems — build real systems, take quizzes, submit implementations, and earn certificates.",
+  "bin": {
+    "100xsystems": "./dist/index.js",
+    "100x": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "src/templates/"
+  ],
+  "scripts": {
+    "build": "tsc && rm -rf dist/templates && mkdir -p dist/templates && cp -r src/templates/. dist/templates/",
+    "prepublishOnly": "npm run build",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@octokit/rest": "^22.0.1",
+    "execa": "^9.6.1",
+    "ink": "^7.1.0",
+    "ink-gradient": "^4.0.1",
+    "ink-spinner": "^5.0.0",
+    "open": "^11.0.0",
+    "pastel": "^4.0.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/100xsystems/100xsystems"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
