@@ -208,10 +208,27 @@ export class TestRunnerExecutor implements Executor {
           category: 'test',
         };
       }
-      const testResults = vitestOutput.testResults || [];
-      const numPassed = testResults.filter((t: any) => t.status === 'pass').length;
-      const numFailed = testResults.filter((t: any) => t.status === 'fail').length;
-      const totalTests = testResults.length;
+
+      // Vitest JSON reporter outputs testResults as an array of file-level results.
+      // Each file result has assertionResults[], which are the individual test cases.
+      // vitest uses "passed"/"failed" for assertion status (past tense).
+      const fileResults = vitestOutput.testResults || [];
+      const assertions: Array<{ status: string; title: string; fullName: string; failureMessages: string[] }> = [];
+      for (const file of fileResults) {
+        const fileAssertions = file.assertionResults || [];
+        for (const a of fileAssertions) {
+          assertions.push({
+            status: a.status,       // "passed" | "failed" | "pending"
+            title: a.title || a.fullName || 'unnamed test',
+            fullName: a.fullName || a.title || '',
+            failureMessages: a.failureMessages || [],
+          });
+        }
+      }
+
+      const numPassed = assertions.filter((a: any) => a.status === 'passed').length;
+      const numFailed = assertions.filter((a: any) => a.status === 'failed').length;
+      const totalTests = assertions.length;
 
       // Check expected passes if specified
       if (opts.expectedPasses !== undefined && numPassed < opts.expectedPasses) {
@@ -219,7 +236,7 @@ export class TestRunnerExecutor implements Executor {
           check: 'test-runner:vitest',
           status: 'fail',
           message: `${numPassed}/${opts.expectedPasses} tests passed (expected ${opts.expectedPasses})`,
-          details: this.formatTestResults(testResults),
+          details: this.formatAssertionResults(assertions),
           category: 'test',
         };
       }
@@ -229,7 +246,7 @@ export class TestRunnerExecutor implements Executor {
           check: 'test-runner:vitest',
           status: 'fail',
           message: `${numFailed} test(s) failed out of ${totalTests}`,
-          details: this.formatTestResults(testResults),
+          details: this.formatAssertionResults(assertions),
           category: 'test',
         };
       }
@@ -423,22 +440,30 @@ export class TestRunnerExecutor implements Executor {
   }
 
   /**
-   * Format vitest JSON results into readable text.
+   * Format vitest assertion-level results into readable text.
+   * Handles vitest's actual JSON format:
+   *   - assertion.status: "passed" | "failed" | "pending"
+   *   - assertion.title: individual test name
+   *   - assertion.failureMessages: string[] of error details
+   *
+   * Shows up to 20 individual tests, each with pass/fail icon and
+   * first line of failure message for failed tests.
    */
-  private formatTestResults(results: any[]): string {
-    if (!results || results.length === 0) return 'No test results';
+  private formatAssertionResults(assertions: Array<{ status: string; title: string; fullName: string; failureMessages: string[] }>): string {
+    if (!assertions || assertions.length === 0) return 'No test results';
 
     const lines: string[] = [];
-    for (const test of results.slice(0, 20)) {
-      const icon = test.status === 'pass' ? '✓' : test.status === 'fail' ? '✗' : '?';
-      const name = test.name || 'unnamed test';
-      lines.push(`  ${icon} ${name}`);
-      if (test.status === 'fail' && test.failureMessage) {
-        lines.push(`     ${test.failureMessage.split('\n')[0].slice(0, 120)}`);
+    for (const a of assertions.slice(0, 20)) {
+      const icon = a.status === 'passed' ? '✓' : a.status === 'failed' ? '✗' : '?';
+      lines.push(`  ${icon} ${a.title}`);
+      if (a.status === 'failed' && a.failureMessages && a.failureMessages.length > 0) {
+        // Show first failure message, truncated and indented
+        const msg = a.failureMessages[0].split('\n')[0].slice(0, 200);
+        lines.push(`     ${msg}`);
       }
     }
-    if (results.length > 20) {
-      lines.push(`  ... and ${results.length - 20} more`);
+    if (assertions.length > 20) {
+      lines.push(`  ... and ${assertions.length - 20} more`);
     }
     return lines.join('\n');
   }
