@@ -6,14 +6,17 @@
  *
  * Instead of just checking "does file exist", this executor:
  * 1. Copies the user's source code into a temp directory
- * 2. Copies the lesson's test.spec.ts from the curriculum into the temp dir
- * 3. Installs vitest (isolated — no pollution of user's project)
+ * 2. Copies the lesson's behavior.test.ts from the curriculum into the temp dir
+ * 3. Installs @100xsystems/test-suite-{framework} (isolated — no pollution of user's project)
  * 4. Runs npx vitest run --reporter json
  * 5. Parses the JSON output and maps each test to a ValidationResult
  * 6. Cleans up the temp directory
  *
+ * The test-suite packages provide shared test helpers and re-export vitest,
+ * so lesson test files don't need to import vitest / fs / path / child_process directly.
+ *
  * Supports multiple frameworks via the `framework` parameter:
- *   - vitest: TypeScript/JavaScript (uses vitest)
+ *   - vitest: TypeScript/JavaScript (uses @100xsystems/test-suite-typescript)
  *   - junit: Java (uses Maven/Gradle surefire — planned)
  *   - go-test: Go (uses `go test` — planned)
  *   - cargo-test: Rust (uses `cargo test` — planned)
@@ -21,7 +24,7 @@
  * @example
  * validation:
  *   - type: test-runner
- *     test_file: "test.spec.ts"
+ *     test_file: "tests/behavior.test.ts"
  *     framework: vitest
  *     timeout: 60000
  *     expected_passes: 6
@@ -116,8 +119,10 @@ export class TestRunnerExecutor implements Executor {
       const testDest = path.join(tmpDir, 'test.spec.ts');
       fs.copyFileSync(testFilePath, testDest);
 
-      // Step 3: Inject vitest dependency into package.json
-      this.ensureDependency(tmpDir, 'vitest', '^3.0.0');
+      // Step 3: Inject test-suite dependency into package.json
+      // The lesson test files import from @100xsystems/test-suite-* (which re-exports vitest),
+      // not from vitest directly. This package pulls in vitest as a dependency.
+      this.ensureDependency(tmpDir, '@100xsystems/test-suite-typescript', '^0.1.0');
 
       // Step 4: Create a minimal vitest.config.ts if none exists
       this.ensureVitestConfig(tmpDir);
