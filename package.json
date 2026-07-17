@@ -1,11 +1,11 @@
 {
   "name": "@100xsystems/cli",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "type": "module",
   "description": "CLI for 100xSystems — build real systems, take quizzes, submit implementations, and earn certificates.",
   "bin": {
-    "100xsystems": "./dist/index.js",
-    "100x": "./dist/index.js"
+    "100xsystems": "dist/index.js",
+    "100x": "dist/index.js"
   },
   "files": [
     "dist/",
@@ -40,7 +40,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/100xsystems/100xsystems"
+    "url": "git+https://github.com/100xsystems/100xsystems.git"
   },
   "publishConfig": {
     "access": "public"

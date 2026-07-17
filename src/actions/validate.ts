@@ -13,7 +13,7 @@ import { execSync } from 'child_process';
 import { readProjectConfig, PROJECT_CONFIG } from '../scaffold/index.js';
 import { runLessonValidators } from '../executors/index.js';
 import type { ExecutorResult } from '../executors/index.js';
-import { CURRICULUM_DIR } from '../reader/index.js';
+import { SYSTEMS_DIR, fetchRegistry, syncSystemFromRegistry } from '../reader/index.js';
 import type { SpecCheck } from '../reader/index.js';
 import { getSpec } from '../reader/spec-reader.js';
 
@@ -188,8 +188,12 @@ async function runLessonValidatorsFromCurriculum(
   lessonSlug?: string
 ): Promise<ValidationResult[]> {
   const results: ValidationResult[] = [];
-  const systemDir = path.join(CURRICULUM_DIR(), 'systems', systemSlug);
-  if (!fs.existsSync(systemDir)) return results;
+  // Resolve the system's curriculum directory:
+  //   1. Cache: ~/.cache/100xsystems/repos/<slug>/  (from registry sync)
+  //   2. Monorepo: <project>/curriculum/systems/<slug>/  (legacy dev)
+  //   3. Registry sync: fetch registry.json and shallow-clone the repo
+  const systemDir = await resolveSystemCurriculumDir(systemSlug);
+  if (!systemDir) return results;
 
   // Find the track directory by slug
   const trackDir = path.join(systemDir, trackSlug);
@@ -249,6 +253,40 @@ async function runLessonValidatorsFromCurriculum(
   }
 
   return results;
+}
+
+/**
+ * Resolve the system's curriculum directory from multiple sources.
+ *
+ * Priority:
+ *   1. SYSTEMS_DIR() + slug — cache (~/.cache/100xsystems/repos/<slug>/) or monorepo
+ *   2. Registry sync — fetch registry.json, find the repo URL, shallow-clone to cache
+ *
+ * Returns the absolute path to the system's curriculum root, or null if not found.
+ */
+async function resolveSystemCurriculumDir(systemSlug: string): Promise<string | null> {
+  // 1. Check SYSTEMS_DIR() — handles cache + monorepo resolution
+  const fromSystems = path.join(SYSTEMS_DIR(), systemSlug);
+  if (fs.existsSync(fromSystems) && fs.existsSync(path.join(fromSystems, 'index.md'))) {
+    return fromSystems;
+  }
+
+  // 2. Try syncing from registry
+  try {
+    const registry = await fetchRegistry();
+    const systemEntry = registry.systems?.find((s: any) => s.slug === systemSlug);
+    if (systemEntry && systemEntry.repo) {
+      await syncSystemFromRegistry(systemSlug, systemEntry.repo);
+      const cached = path.join(SYSTEMS_DIR(), systemSlug);
+      if (fs.existsSync(cached)) {
+        return cached;
+      }
+    }
+  } catch {
+    // Registry unavailable — continue with local-only results
+  }
+
+  return null;
 }
 
 /**
@@ -633,11 +671,12 @@ export function checkLevel1(projectDir: string, systemSlug?: string, trackSlug?:
   // may run validation outside the monorepo (e.g., from their project dir)
   if (systemSlug && trackSlug) {
     try {
-      const curriculumDir = path.join(CURRICULUM_DIR(), 'systems', systemSlug, trackSlug);
+      // Use SYSTEMS_DIR() which resolves cache (~/.cache/100xsystems/repos/) or monorepo
+      const curriculumDir = path.join(SYSTEMS_DIR(), systemSlug, trackSlug);
       if (fs.existsSync(curriculumDir)) {
         results.push({ check: 'curriculum', status: 'pass', message: `Curriculum found: ${systemSlug}/${trackSlug}`, category: 'structure', level: 1 });
       } else {
-        results.push({ check: 'curriculum', status: 'warn', message: `Could not verify curriculum path for ${systemSlug}/${trackSlug}. Ensure CURRICULUM_PATH is set if running outside the repo.`, category: 'structure', level: 1 });
+        results.push({ check: 'curriculum', status: 'warn', message: `Curriculum "${systemSlug}/${trackSlug}" not found locally. Try running \`100xsystems list\` first to sync from registry.`, category: 'structure', level: 1 });
       }
     } catch {
       results.push({ check: 'curriculum', status: 'warn', message: `Could not check curriculum path (running outside monorepo?)`, category: 'structure', level: 1 });

@@ -159,11 +159,17 @@ export class TestRunnerExecutor implements Executor {
 
       // Step 7: Parse JSON output
       const stdout = vitestResult.stdout || '';
-      const jsonMatch = stdout.match(/\{[\s\S]*"testResults"[\s\S]*\}/);
+      const stderr = vitestResult.stderr || '';
+
+      // Vitest JSON reporter outputs JSON on stdout. The output is a JSON object
+      // with "testResults" array. If vitest fails to compile, it may print errors.
+      // Use a capture group to extract the JSON block safely.
+      const jsonMatch = stdout.match(/(\{[\s\S]*"testResults"[\s\S]*\})/);
 
       if (!jsonMatch) {
-        // Vitest might have printed non-JSON output on failure
-        const failLines = stdout.split('\n')
+        // Vitest might have printed non-JSON output on failure (e.g., compilation errors)
+        const allOutput = stdout + '\n' + stderr;
+        const failLines = allOutput.split('\n')
           .filter((l: string) => l.includes('FAIL') || l.includes('✗') || l.includes('Error'))
           .slice(0, 10);
 
@@ -182,14 +188,26 @@ export class TestRunnerExecutor implements Executor {
           status: vitestResult.exitCode === 0 ? 'pass' : 'fail',
           message: vitestResult.exitCode === 0
             ? 'All tests passed'
-            : `Tests exited with code ${vitestResult.exitCode}`,
-          details: stdout.slice(0, 500),
+            : `Tests exited with code ${vitestResult.exitCode} — ensure your implementation meets the lesson requirements`,
+          details: (stdout + '\n' + stderr).slice(0, 500),
           category: 'test',
         };
       }
 
-      // Parse the JSON
-      const vitestOutput = JSON.parse(jsonMatch[1]);
+      // Parse the JSON — jsonMatch[0] is the full match (capture group is entire JSON object)
+      let vitestOutput: any;
+      try {
+        vitestOutput = JSON.parse(jsonMatch[0]);
+      } catch {
+        // JSON was matched by regex but failed to parse — show raw output
+        return {
+          check: 'test-runner:vitest',
+          status: 'error',
+          message: 'Failed to parse vitest output as JSON',
+          details: stdout.slice(0, 500),
+          category: 'test',
+        };
+      }
       const testResults = vitestOutput.testResults || [];
       const numPassed = testResults.filter((t: any) => t.status === 'pass').length;
       const numFailed = testResults.filter((t: any) => t.status === 'fail').length;
