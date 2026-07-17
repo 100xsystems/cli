@@ -763,14 +763,17 @@ export class TestRunnerExecutor implements Executor {
       return;
     }
 
-    // Fallback: helpers not found — the test must extend BaseTest, which won't compile
-    // In this case, the test will fail with a compilation error and the user will see why.
-    // This shouldn't happen in production since the build includes templates.
+    // If templates aren't bundled, warn so the user gets a clear error message
+    // instead of a cryptic "cannot find symbol: BaseTest" from javac.
+    console.warn(`[100xsystems] Java test helpers not found at ${helpersDir}. ` +
+      `Ensure the CLI is properly built (npm run build) to bundle the templates.`);
   }
 
   /**
-   * Ensure JUnit 5 and test-suite-java dependencies are in the user's pom.xml.
-   * Also adds the GitHub Packages repository for test-suite-java.
+   * Ensure JUnit 5 and surefire plugin are in the user's pom.xml.
+   * Merges JUnit 5 into the EXISTING <dependencies> section if present,
+   * or creates a new one if the pom has none. Same for <build>/<plugins>.
+   * This avoids creating duplicate sections which Maven would reject.
    */
   private ensureMavenDependencies(tmpDir: string): void {
     const pomPath = path.join(tmpDir, 'pom.xml');
@@ -796,26 +799,35 @@ export class TestRunnerExecutor implements Executor {
     try {
       let pom = fs.readFileSync(pomPath, 'utf-8');
 
-      // Check if JUnit 5 is already in the pom
+      // Inject JUnit 5 dependency into the EXISTING <dependencies> section
       if (!pom.includes('junit-jupiter')) {
-        // Inject JUnit 5 dependency before closing </project>
-        const junitDep = `
-    <dependencies>
+        const junitEntry = `
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>5.11.0</version>
             <scope>test</scope>
-        </dependency>
+        </dependency>`;
+
+        // Check if the pom already has a <dependencies> block
+        const depsMatch = pom.match(/<dependencies>[\s\S]*?<\/dependencies>/);
+        if (depsMatch && depsMatch.index !== undefined) {
+          // Merge into existing <dependencies> block — insert before </dependencies>
+          pom = pom.slice(0, depsMatch.index + depsMatch[0].lastIndexOf('</dependencies>'))
+            + junitEntry
+            + pom.slice(depsMatch.index + depsMatch[0].lastIndexOf('</dependencies>'));
+        } else {
+          // No existing <dependencies> — create one before </project>
+          const newDepsBlock = `
+    <dependencies>${junitEntry}
     </dependencies>`;
-        pom = pom.replace('</project>', junitDep + '\n</project>');
+          pom = pom.replace('</project>', newDepsBlock + '\n</project>');
+        }
       }
 
-      // Ensure surefire plugin is configured
+      // Ensure surefire plugin is configured — merge into existing <plugins>
       if (!pom.includes('maven-surefire-plugin')) {
-        const surefire = `
-    <build>
-        <plugins>
+        const surefireEntry = `
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -826,15 +838,34 @@ export class TestRunnerExecutor implements Executor {
                         <include>**/*Tests.java</include>
                     </includes>
                 </configuration>
-            </plugin>
+            </plugin>`;
+
+        const pluginsMatch = pom.match(/<plugins>[\s\S]*?<\/plugins>/);
+        if (pluginsMatch && pluginsMatch.index !== undefined) {
+          // Merge into existing <plugins> block
+          pom = pom.slice(0, pluginsMatch.index + pluginsMatch[0].lastIndexOf('</plugins>'))
+            + surefireEntry
+            + pom.slice(pluginsMatch.index + pluginsMatch[0].lastIndexOf('</plugins>'));
+        } else if (pom.includes('<build>')) {
+          // Has <build> but no <plugins> — create <plugins> inside <build>
+          const newPluginsBlock = `
+        <plugins>${surefireEntry}
+        </plugins>`;
+          pom = pom.replace('</build>', newPluginsBlock + '\n    </build>');
+        } else {
+          // No <build> section — create one before </project>
+          const newBuildBlock = `
+    <build>
+        <plugins>${surefireEntry}
         </plugins>
     </build>`;
-        pom = pom.replace('</project>', surefire + '\n</project>');
+          pom = pom.replace('</project>', newBuildBlock + '\n</project>');
+        }
       }
 
       fs.writeFileSync(pomPath, pom, 'utf-8');
     } catch {
-      // If we can't modify pom.xml, the mvn test will fail with a clear error
+      // If we can't modify pom.xml, mvn test will fail with a clear error
     }
   }
 
