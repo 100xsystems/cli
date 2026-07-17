@@ -9,17 +9,27 @@ interface ValidationReportProps {
 }
 
 /**
- * Displays validation results grouped by category.
- * Shows pass/warn/fail counts and lists issues.
+ * Displays validation results grouped by category and level.
+ * Shows ALL results—not just L1 structure checks. L2 lesson validators
+ * and L3 spec checks are included alongside the basic checks.
+ *
+ * Items with `details` (e.g., test failure output) are shown in a dimmed
+ * block below their result message.
  */
 export function ValidationReport({ results, systemTitle }: ValidationReportProps) {
   const passCount = results.filter(r => r.status === 'pass').length;
   const warnCount = results.filter(r => r.status === 'warn').length;
   const failCount = results.filter(r => r.status === 'fail').length;
 
-  // Group by category
-  const categories = ['documentation', 'structure', 'git'] as const;
-  const grouped = categories.map(cat => ({
+  // Collect ALL categories present in the results, in display order
+  const CATEGORY_ORDER = [
+    'documentation', 'structure', 'code', 'test', 'lesson',
+    'validation', 'build', 'spec', 'git',
+  ] as const;
+  const presentCategories = [...new Set(results.map(r => r.category))];
+  const ordered = CATEGORY_ORDER.filter(c => presentCategories.includes(c));
+
+  const grouped = ordered.map(cat => ({
     name: cat.charAt(0).toUpperCase() + cat.slice(1),
     items: results.filter(r => r.category === cat),
   })).filter(g => g.items.length > 0);
@@ -37,12 +47,31 @@ export function ValidationReport({ results, systemTitle }: ValidationReportProps
             const icon = result.status === 'pass' ? <Text color="green">✓</Text>
               : result.status === 'warn' ? <Text color="yellow">⚠</Text>
               : <Text color="red">✗</Text>;
+
+            const levelTag = result.level && result.level > 1
+              ? <Text color="dimColor">[L{result.level}] </Text>
+              : null;
+
             return (
-              <Text key={i}>
-                <Text>  </Text>
-                {icon}
-                <Text> {result.message}</Text>
-              </Text>
+              <Box key={i} flexDirection="column">
+                <Text>
+                  <Text>  </Text>
+                  {icon}
+                  <Text> </Text>
+                  {levelTag}
+                  <Text>{result.message}</Text>
+                </Text>
+                {result.details && (result.status === 'fail' || result.status === 'warn') && (
+                  <Box marginLeft={4}>
+                    <Text dimColor>{(function() {
+                      const lines = result.details!.split('\n');
+                      const shown = lines.slice(0, 8);
+                      const out = shown.join('\n');
+                      return lines.length > 8 ? out + '\n      ... (truncated)' : out;
+                    })()}</Text>
+                  </Box>
+                )}
+              </Box>
             );
           })}
         </Box>

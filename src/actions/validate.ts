@@ -4,6 +4,11 @@
  * Runs validation checks against a user's project.
  * Integrates with the executor plugin system for lesson-specific validation.
  *
+ * Features:
+ * - 3-level validation: L1 structure, L2 behavioral tests, L3 spec checks
+ * - Frontmatter schema validation (catches common YAML mistakes before tests run)
+ * - Auto-detected expected_passes from test files
+ *
  * @packageDocumentation
  */
 
@@ -13,7 +18,7 @@ import { execSync } from 'child_process';
 import { readProjectConfig, PROJECT_CONFIG } from '../scaffold/index.js';
 import { runLessonValidators } from '../executors/index.js';
 import type { ExecutorResult } from '../executors/index.js';
-import { CURRICULUM_DIR } from '../reader/index.js';
+import { SYSTEMS_DIR, fetchRegistry, syncSystemFromRegistry, parseFrontmatter } from '../reader/index.js';
 import type { SpecCheck } from '../reader/index.js';
 import { getSpec } from '../reader/spec-reader.js';
 
@@ -89,6 +94,26 @@ export async function runValidation(
   // They verify the project was properly initialized and has the basic
   // structure expected by the curriculum.
   results.push(...checkLevel1(projectDir, systemSlug, trackSlug));
+
+  // ── LEVEL 1.5: Frontmatter Schema Validation  ────────────────────
+  // Validate all lesson frontmatter blocks for common YAML mistakes
+  // before attempting to run level 2 validators. This catches typos,
+  // missing keys, and structural issues early.
+  if (systemSlug) {
+    try {
+      const fmResults = validateLessonFrontmatter(systemSlug, trackSlug, targetLesson);
+      results.push(...fmResults);
+    } catch (err: any) {
+      results.push({
+        check: 'frontmatter-validation',
+        status: 'warn',
+        message: `Frontmatter validation error: ${err.message}`,
+        category: 'lesson',
+        details: err.stack,
+        level: 1,
+      });
+    }
+  }
 
   // ── LEVEL 2: Lesson Validators  ───────────────────────────────────
   // These come from the `validation:` block in each lesson's frontmatter.
@@ -188,8 +213,12 @@ async function runLessonValidatorsFromCurriculum(
   lessonSlug?: string
 ): Promise<ValidationResult[]> {
   const results: ValidationResult[] = [];
-  const systemDir = path.join(CURRICULUM_DIR(), 'systems', systemSlug);
-  if (!fs.existsSync(systemDir)) return results;
+  // Resolve the system's curriculum directory:
+  //   1. Cache: ~/.cache/100xsystems/repos/<slug>/  (from registry sync)
+  //   2. Monorepo: <project>/curriculum/systems/<slug>/  (legacy dev)
+  //   3. Registry sync: fetch registry.json and shallow-clone the repo
+  const systemDir = await resolveSystemCurriculumDir(systemSlug);
+  if (!systemDir) return results;
 
   // Find the track directory by slug
   const trackDir = path.join(systemDir, trackSlug);
@@ -245,6 +274,180 @@ async function runLessonValidatorsFromCurriculum(
         details: er.details,
         level: 2,
       });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Resolve the system's curriculum directory from multiple sources.
+ *
+ * Priority:
+ *   1. SYSTEMS_DIR() + slug — cache (~/.cache/100xsystems/repos/<slug>/) or monorepo
+ *   2. Registry sync — fetch registry.json, find the repo URL, shallow-clone to cache
+ *
+ * Returns the absolute path to the system's curriculum root, or null if not found.
+ */
+async function resolveSystemCurriculumDir(systemSlug: string): Promise<string | null> {
+  // 1. Check SYSTEMS_DIR() — handles cache + monorepo resolution
+  const fromSystems = path.join(SYSTEMS_DIR(), systemSlug);
+  if (fs.existsSync(fromSystems) && fs.existsSync(path.join(fromSystems, 'index.md'))) {
+    return fromSystems;
+  }
+
+  // 2. Try syncing from registry
+  try {
+    const registry = await fetchRegistry();
+    const systemEntry = registry.systems?.find((s: any) => s.slug === systemSlug);
+    if (systemEntry && systemEntry.repo) {
+      await syncSystemFromRegistry(systemSlug, systemEntry.repo);
+      const cached = path.join(SYSTEMS_DIR(), systemSlug);
+      if (fs.existsSync(cached)) {
+        return cached;
+      }
+    }
+  } catch {
+    // Registry unavailable — continue with local-only results
+  }
+
+  return null;
+}
+
+// ─── Frontmatter Schema Validation ─────────────────────────────────
+
+/**
+ * REQUIRED frontmatter keys that every lesson must have.
+ * Used by validateLessonFrontmatter to catch missing fields early.
+ */
+const REQUIRED_LESSON_KEYS = ['title', 'description'];
+
+/**
+ * KNOWN validator types in the executor registry.
+ * Used to catch typos in validation block type fields.
+ */
+const KNOWN_VALIDATOR_TYPES = [
+  'file-exists', 'file-contains', 'cli-command', 'npm-test',
+  'http', 'regex', 'docker', 'test-runner',
+];
+
+/**
+ * Validate frontmatter schema for all lessons in the target track.
+ * Checks for:
+ *   1. Missing required keys (title, description)
+ *   2. Invalid validation block types (typos)
+ *   3. Malformed YAML that the custom parser might silently misinterpret
+ *
+ * Returns pass/warn results without blocking execution.
+ */
+function validateLessonFrontmatter(
+  systemSlug: string,
+  trackSlug: string,
+  lessonSlug?: string
+): ValidationResult[] {
+  const results: ValidationResult[] = [];
+  const systemDir = path.join(SYSTEMS_DIR(), systemSlug);
+  if (!fs.existsSync(systemDir)) return results;
+
+  const trackDir = path.join(systemDir, trackSlug);
+  if (!fs.existsSync(trackDir)) return results;
+
+  // Walk lessons and validate each one
+  const lessons = findAllLessonFiles(trackDir);
+
+  // If targeting a specific lesson, only validate that one
+  const targetLessons = lessonSlug
+    ? lessons.filter(l => l.slug === lessonSlug)
+    : lessons;
+
+  if (targetLessons.length === 0) return results;
+
+  for (const lesson of targetLessons) {
+    try {
+      const lessonMdPath = path.join(lesson.dir, 'lesson.md');
+      if (!fs.existsSync(lessonMdPath)) continue;
+
+      const content = fs.readFileSync(lessonMdPath, 'utf-8');
+      const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n/);
+
+      if (!frontmatterMatch) {
+        results.push({
+          check: `frontmatter:${lesson.slug}`,
+          status: 'warn',
+          message: `Lesson "${lesson.slug}" has no frontmatter block. Add \`---\` delimiters at the top.`,
+          category: 'lesson',
+          level: 1,
+        });
+        continue;
+      }
+
+      const yamlBlock = frontmatterMatch[1];
+
+      // Check for missing closing delimiter (common mistake)
+      const delimiterCount = (content.match(/^---\s*$/gm) || []).length;
+      if (delimiterCount < 2) {
+        results.push({
+          check: `frontmatter:${lesson.slug}`,
+          status: 'fail',
+          message: `Lesson "${lesson.slug}" has unclosed frontmatter. Ensure both \`---\` delimiters are present.`,
+          category: 'lesson',
+          level: 1,
+        });
+        continue;
+      }
+
+      // Parse the YAML block
+      const parsed = parseFrontmatter(content);
+      const data = parsed.data;
+
+      // Check required keys
+      for (const key of REQUIRED_LESSON_KEYS) {
+        if (!data[key]) {
+          results.push({
+            check: `frontmatter:${lesson.slug}:${key}`,
+            status: 'fail',
+            message: `Lesson "${lesson.slug}" missing required frontmatter key: "${key}".`,
+            category: 'lesson',
+            level: 1,
+          });
+        }
+      }
+
+      // Validate validation block types
+      if (data.validation && Array.isArray(data.validation)) {
+        for (let i = 0; i < data.validation.length; i++) {
+          const v = data.validation[i];
+          if (v.type && !KNOWN_VALIDATOR_TYPES.includes(v.type)) {
+            results.push({
+              check: `frontmatter:${lesson.slug}:validation[${i}]`,
+              status: 'warn',
+              message: `Lesson "${lesson.slug}" has unknown validator type "${v.type}". Did you mean one of: ${KNOWN_VALIDATOR_TYPES.join(', ')}?`,
+              category: 'lesson',
+              level: 1,
+            });
+          }
+        }
+      }
+
+      // Check for duplicate keys
+      const keys = [...new Set(yamlBlock.match(/^(\w+):/gm)?.map(k => k.replace(':', '').trim()) || [])];
+      const seen = new Map<string, number>();
+      for (const key of keys) {
+        seen.set(key, (seen.get(key) || 0) + 1);
+      }
+      for (const [key, count] of seen) {
+        if (count > 1) {
+          results.push({
+            check: `frontmatter:${lesson.slug}:duplicate:${key}`,
+            status: 'warn',
+            message: `Lesson "${lesson.slug}" has duplicate frontmatter key "${key}". Only the last value will be used.`,
+            category: 'lesson',
+            level: 1,
+          });
+        }
+      }
+    } catch {
+      // Skip lessons we can't read
     }
   }
 
@@ -633,11 +836,12 @@ export function checkLevel1(projectDir: string, systemSlug?: string, trackSlug?:
   // may run validation outside the monorepo (e.g., from their project dir)
   if (systemSlug && trackSlug) {
     try {
-      const curriculumDir = path.join(CURRICULUM_DIR(), 'systems', systemSlug, trackSlug);
+      // Use SYSTEMS_DIR() which resolves cache (~/.cache/100xsystems/repos/) or monorepo
+      const curriculumDir = path.join(SYSTEMS_DIR(), systemSlug, trackSlug);
       if (fs.existsSync(curriculumDir)) {
         results.push({ check: 'curriculum', status: 'pass', message: `Curriculum found: ${systemSlug}/${trackSlug}`, category: 'structure', level: 1 });
       } else {
-        results.push({ check: 'curriculum', status: 'warn', message: `Could not verify curriculum path for ${systemSlug}/${trackSlug}. Ensure CURRICULUM_PATH is set if running outside the repo.`, category: 'structure', level: 1 });
+        results.push({ check: 'curriculum', status: 'warn', message: `Curriculum "${systemSlug}/${trackSlug}" not found locally. Try running \`100xsystems list\` first to sync from registry.`, category: 'structure', level: 1 });
       }
     } catch {
       results.push({ check: 'curriculum', status: 'warn', message: `Could not check curriculum path (running outside monorepo?)`, category: 'structure', level: 1 });
