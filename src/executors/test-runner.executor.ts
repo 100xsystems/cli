@@ -71,8 +71,10 @@ const EXCLUDED_DIRS = new Set([
   '.cache', 'coverage', 'target', 'out', '.100x',
 ]);
 
+// Java extensions are added alongside TypeScript for JUnit test execution
 const SOURCE_EXTENSIONS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.json', '.mjs', '.cjs',
+  '.java', '.xml', '.yml', '.yaml', '.properties',
 ]);
 
 // ─── Executor ───────────────────────────────────────────────────────
@@ -305,19 +307,147 @@ export class TestRunnerExecutor implements Executor {
     }
   }
 
-  // ── JUnit Runner (Java) — Planned ────────────────────────────────
+  // ── JUnit Runner (Java) ──────────────────────────────────────────
+  //
+  // Workflow:
+  //   1. Copy user's Java source files into temp dir
+  //   2. Copy the lesson's JUnit test file into src/test/java/
+  //   3. Copy BaseTest.java + FileHelper.java + BuildHelper.java
+  //      directly into the test source tree (no external dependency needed)
+  //   4. Inject JUnit 5 dependencies into the user's pom.xml
+  //   5. Run `mvn test`
+  //   6. Parse surefire XML reports for per-test results
+  //
+  // This approach does NOT require GitHub Packages authentication —
+  // the helper source files are compiled inline as part of the user's
+  // project. This keeps the validation self-contained and zero-config.
 
   private async runJUnit(
-    _testFilePath: string,
-    _ctx: ExecutorContext,
-    _opts: { timeout: number; expectedPasses?: number },
+    testFilePath: string,
+    ctx: ExecutorContext,
+    opts: { timeout: number; expectedPasses?: number },
   ): Promise<ExecutorResult> {
-    return {
-      check: 'test-runner:junit',
-      status: 'error',
-      message: 'JUnit test runner not yet implemented. Coming soon for Java tracks.',
-      category: 'test',
-    };
+    const tmpDir = await this.createTempDir('junit');
+    this.registerTempDir(tmpDir);
+    let cleanup = true;
+
+    try {
+      // Step 1: Copy user's Java source files into temp dir
+      this.copyJavaProject(ctx.projectDir, tmpDir);
+
+      // Step 2: Create src/test/java directory and copy lesson test file
+      const testJavaDir = path.join(tmpDir, 'src', 'test', 'java');
+      fs.mkdirSync(testJavaDir, { recursive: true });
+
+      // Copy the lesson's JUnit test file into the test source tree
+      const testFileName = path.basename(testFilePath);
+      const testDest = path.join(testJavaDir, testFileName);
+      fs.copyFileSync(testFilePath, testDest);
+
+      // Step 3: Copy the test helper source files (BaseTest, FileHelper, BuildHelper)
+      // into the test source tree so they compile alongside the lesson test.
+      // These are the "test-suite-java" helpers provided inline — no Maven dependency needed.
+      await this.copyTestSuiteJavaHelpers(testJavaDir);
+
+      // Step 4: Inject JUnit 5 dependencies into the user's pom.xml
+      this.ensureMavenDependencies(tmpDir);
+
+      // Step 5: Run mvn test
+      const mvnResult = await execa('mvn', ['test', '-q'], {
+        cwd: tmpDir,
+        timeout: opts.timeout,
+        reject: false,
+        stdio: 'pipe',
+      });
+
+      const stdout = mvnResult.stdout || '';
+      const stderr = mvnResult.stderr || '';
+
+      // Step 6: Parse surefire XML reports for per-test results
+      const reportsDir = path.join(tmpDir, 'target', 'surefire-reports');
+      const assertionResults = this.parseSurefireReports(reportsDir);
+
+      const numPassed = assertionResults.filter((a: any) => a.status === 'passed').length;
+      const numFailed = assertionResults.filter((a: any) => a.status === 'failed').length;
+      const totalTests = assertionResults.length;
+
+      if (totalTests === 0) {
+        // No surefire reports — fall back to exit code
+        if (mvnResult.exitCode === 0) {
+          return {
+            check: 'test-runner:junit',
+            status: 'pass',
+            message: 'All tests passed',
+            category: 'test',
+          };
+        }
+
+        // Extract failure info from Maven output
+        const failLines = (stdout + '\n' + stderr).split('\n')
+          .filter((l: string) => l.includes('FAIL') || l.includes('ERROR') || l.includes('Tests run:'))
+          .slice(0, 15);
+
+        return {
+          check: 'test-runner:junit',
+          status: 'fail',
+          message: `Maven tests failed (exit code ${mvnResult.exitCode})`,
+          details: failLines.join('\n').slice(0, 1000),
+          category: 'test',
+        };
+      }
+
+      // Check expected passes
+      if (opts.expectedPasses !== undefined && numPassed < opts.expectedPasses) {
+        return {
+          check: 'test-runner:junit',
+          status: 'fail',
+          message: `${numPassed}/${opts.expectedPasses} tests passed (expected ${opts.expectedPasses})`,
+          details: this.formatJUnitResults(assertionResults),
+          category: 'test',
+        };
+      }
+
+      if (numFailed > 0) {
+        return {
+          check: 'test-runner:junit',
+          status: 'fail',
+          message: `${numFailed} test(s) failed out of ${totalTests}`,
+          details: this.formatJUnitResults(assertionResults),
+          category: 'test',
+        };
+      }
+
+      return {
+        check: 'test-runner:junit',
+        status: 'pass',
+        message: `All ${numPassed} test(s) passed`,
+        details: totalTests > 0
+          ? `Passed: ${numPassed}, Failed: ${numFailed}, Total: ${totalTests}`
+          : undefined,
+        category: 'test',
+      };
+
+    } catch (err: any) {
+      if (err.isTimeout) {
+        return {
+          check: 'test-runner:junit',
+          status: 'fail',
+          message: `Test execution timed out after ${opts.timeout}ms`,
+          category: 'test',
+        };
+      }
+      return {
+        check: 'test-runner:junit',
+        status: 'error',
+        message: `JUnit test runner error: ${err.message}`,
+        details: err.stderr?.slice(0, 500),
+        category: 'test',
+      };
+    } finally {
+      if (cleanup) {
+        this.cleanupTempDir(tmpDir);
+      }
+    }
   }
 
   // ── Go Test Runner — Planned ──────────────────────────────────────
@@ -566,6 +696,241 @@ export class TestRunnerExecutor implements Executor {
   private isSourceFile(name: string): boolean {
     const ext = path.extname(name);
     return SOURCE_EXTENSIONS.has(ext);
+  }
+
+  // ── Java-Specific Helpers ────────────────────────────────────────
+
+  /**
+   * Copy user's Java Maven project files into the temp directory.
+   * Includes src/main/java/, pom.xml, and other essential config files.
+   * Excludes target/, .git, node_modules, etc.
+   */
+  private copyJavaProject(projectDir: string, tmpDir: string): void {
+    // Copy pom.xml
+    const pomPath = path.join(projectDir, 'pom.xml');
+    if (fs.existsSync(pomPath)) {
+      fs.copyFileSync(pomPath, path.join(tmpDir, 'pom.xml'));
+    }
+
+    // Copy src/main/java/ (the Java source tree)
+    const srcMainJava = path.join(projectDir, 'src', 'main', 'java');
+    if (fs.existsSync(srcMainJava)) {
+      const destMainJava = path.join(tmpDir, 'src', 'main', 'java');
+      fs.mkdirSync(destMainJava, { recursive: true });
+      this.copyDirRecursive(srcMainJava, destMainJava);
+    }
+
+    // Copy src/main/resources/
+    const srcMainResources = path.join(projectDir, 'src', 'main', 'resources');
+    if (fs.existsSync(srcMainResources)) {
+      const destMainResources = path.join(tmpDir, 'src', 'main', 'resources');
+      fs.mkdirSync(destMainResources, { recursive: true });
+      this.copyDirRecursive(srcMainResources, destMainResources);
+    }
+
+    // Copy other config files at root level
+    for (const cfg of ['.mvn', 'mvnw', 'mvnw.cmd', 'checkstyle.xml', 'settings.xml']) {
+      const cfgPath = path.join(projectDir, cfg);
+      if (fs.existsSync(cfgPath)) {
+        try {
+          if (fs.statSync(cfgPath).isDirectory()) {
+            this.copyDirRecursive(cfgPath, path.join(tmpDir, cfg));
+          } else {
+            fs.copyFileSync(cfgPath, path.join(tmpDir, cfg));
+          }
+        } catch {
+          // Skip unreadable files
+        }
+      }
+    }
+  }
+
+  /**
+   * Copy the test-suite-java helper source files into the temp test tree.
+   * These are the inline Java equivalents of the @100xsystems/test-suite-java
+   * package — BaseTest.java, FileHelper.java, BuildHelper.java.
+   *
+   * The source files live alongside the test-runner executor in the CLI
+   * distribution. They are compiled inline as part of the user's project,
+   * so no external Maven dependency or GitHub Packages auth is needed.
+   */
+  private async copyTestSuiteJavaHelpers(testJavaDir: string): Promise<void> {
+    // The helpers are bundled with the CLI in a templates/java-test-helpers/ directory
+    const helpersDir = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'templates', 'java-test-helpers');
+
+    if (fs.existsSync(helpersDir)) {
+      this.copyDirRecursive(helpersDir, testJavaDir);
+      return;
+    }
+
+    // Fallback: helpers not found — the test must extend BaseTest, which won't compile
+    // In this case, the test will fail with a compilation error and the user will see why.
+    // This shouldn't happen in production since the build includes templates.
+  }
+
+  /**
+   * Ensure JUnit 5 and test-suite-java dependencies are in the user's pom.xml.
+   * Also adds the GitHub Packages repository for test-suite-java.
+   */
+  private ensureMavenDependencies(tmpDir: string): void {
+    const pomPath = path.join(tmpDir, 'pom.xml');
+    if (!fs.existsSync(pomPath)) {
+      // Create a minimal pom.xml
+      fs.writeFileSync(pomPath, `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.100xsystems</groupId>
+    <artifactId>student-project</artifactId>
+    <version>1.0.0</version>
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+</project>
+`);
+    }
+
+    try {
+      let pom = fs.readFileSync(pomPath, 'utf-8');
+
+      // Check if JUnit 5 is already in the pom
+      if (!pom.includes('junit-jupiter')) {
+        // Inject JUnit 5 dependency before closing </project>
+        const junitDep = `
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>`;
+        pom = pom.replace('</project>', junitDep + '\n</project>');
+      }
+
+      // Ensure surefire plugin is configured
+      if (!pom.includes('maven-surefire-plugin')) {
+        const surefire = `
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>`;
+        pom = pom.replace('</project>', surefire + '\n</project>');
+      }
+
+      fs.writeFileSync(pomPath, pom, 'utf-8');
+    } catch {
+      // If we can't modify pom.xml, the mvn test will fail with a clear error
+    }
+  }
+
+  /**
+   * Parse Maven surefire XML reports to extract per-test results.
+   * Surefire generates one XML file per test class in target/surefire-reports/.
+   * Format:
+   *   <testsuite tests="6" failures="0" errors="0" skipped="0">
+   *     <testcase name="testMethod" classname="com.example.Test" time="0.123"/>
+   *     <testcase name="testFail" classname="com.example.Test" time="0.456">
+   *       <failure message="expected X but got Y" type="AssertionError">
+   *         stacktrace...
+   *       </failure>
+   *     </testcase>
+   *   </testsuite>
+   */
+  private parseSurefireReports(reportsDir: string): Array<{ status: string; title: string; failureMessages: string[] }> {
+    const assertions: Array<{ status: string; title: string; failureMessages: string[] }> = [];
+
+    if (!fs.existsSync(reportsDir)) return assertions;
+
+    try {
+      const files = fs.readdirSync(reportsDir).filter(f => f.endsWith('.xml'));
+
+      for (const file of files) {
+        const content = fs.readFileSync(path.join(reportsDir, file), 'utf-8');
+
+        // Extract each testcase element using regex
+        const testCaseRegex = /<testcase\s+[^>]*name="([^"]+)"[^>]*>[\s\S]*?<\/testcase>/g;
+        let match: RegExpExecArray | null;
+
+        while ((match = testCaseRegex.exec(content)) !== null) {
+          const testCaseXml = match[0];
+          const testName = match[1];
+          const fullName = testName;
+
+          // Check for failure or error elements
+          const hasFailure = /<failure\s/.test(testCaseXml);
+          const hasError = /<error\s/.test(testCaseXml);
+
+          if (hasFailure || hasError) {
+            // Extract failure messages
+            const failureMsgs: string[] = [];
+            const failureRegex = /<failure[^>]*message="([^"]*)"[^>]*>/g;
+            const errorRegex = /<error[^>]*message="([^"]*)"[^>]*>/g;
+            let fm: RegExpExecArray | null;
+            while ((fm = failureRegex.exec(testCaseXml)) !== null) {
+              failureMsgs.push(fm[1]);
+            }
+            while ((fm = errorRegex.exec(testCaseXml)) !== null) {
+              failureMsgs.push(fm[1]);
+            }
+
+            assertions.push({
+              status: 'failed',
+              title: fullName,
+              failureMessages: failureMsgs.length > 0 ? failureMsgs : [`${hasFailure ? 'Assertion' : 'Error'} in ${fullName}`],
+            });
+          } else {
+            assertions.push({
+              status: 'passed',
+              title: fullName,
+              failureMessages: [],
+            });
+          }
+        }
+      }
+    } catch {
+      // If parsing fails, return empty — fallback to exit code
+    }
+
+    return assertions;
+  }
+
+  /**
+   * Format JUnit assertion results for display.
+   * Similar to formatAssertionResults for vitest.
+   */
+  private formatJUnitResults(assertions: Array<{ status: string; title: string; failureMessages: string[] }>): string {
+    if (!assertions || assertions.length === 0) return 'No test results';
+
+    const lines: string[] = [];
+    for (const a of assertions.slice(0, 20)) {
+      const icon = a.status === 'passed' ? '✓' : a.status === 'failed' ? '✗' : '?';
+      // Simplify title: "className.testMethod" → "testMethod"
+      const shortName = a.title.includes('.') ? a.title.split('.').slice(-1)[0] : a.title;
+      lines.push(`  ${icon} ${shortName}`);
+      if (a.status === 'failed' && a.failureMessages && a.failureMessages.length > 0) {
+        const msg = a.failureMessages[0].split('\n')[0].slice(0, 200);
+        lines.push(`     ${msg}`);
+      }
+    }
+    if (assertions.length > 20) {
+      lines.push(`  ... and ${assertions.length - 20} more`);
+    }
+    return lines.join('\n');
   }
 
   /**
