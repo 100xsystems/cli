@@ -15,6 +15,25 @@
  * The test-suite packages provide shared test helpers and re-export vitest,
  * so lesson test files don't need to import vitest / fs / path / child_process directly.
  *
+ * ## Auto-detect expected_passes
+ *
+ * The `expected_passes` field in frontmatter is now OPTIONAL. If omitted,
+ * the executor parses the test file to count `it()` and `test()` blocks
+ * automatically. If specified, it's used as the minimum required passes.
+ * This eliminates manual count drift as tests are added/removed.
+ *
+ * ## npm dependency caching
+ *
+ * To avoid `npm install` on every validation run, the executor maintains
+ * a warm cache at `~/.cache/100xsystems/test-node-modules/`. It creates a
+ * snapshot of the dependency manifest, then symlinks from cache when possible.
+ *
+ * ## Temp dir cleanup
+ *
+ * All created temp directories are tracked in a registry file at
+ * `~/.cache/100xsystems/test-tmp-dirs.json`. On executor startup, stale
+ * entries (older than 1 hour) are cleaned up automatically.
+ *
  * Supports multiple frameworks via the `framework` parameter:
  *   - vitest: TypeScript/JavaScript (uses @100xsystems/test-suite-typescript)
  *   - junit: Java (uses Maven/Gradle surefire — planned)
@@ -27,20 +46,26 @@
  *     test_file: "tests/behavior.test.ts"
  *     framework: vitest
  *     timeout: 60000
- *     expected_passes: 6
+ *     # expected_passes is AUTO-DETECTED from the test file
  *
  * @packageDocumentation
  */
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import crypto from 'crypto';
 import { execa, execaSync } from 'execa';
-import { randomBytes } from 'crypto';
 import { type Executor, type ExecutorResult, type ExecutorContext } from './types.js';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
 const TEMP_BASE = '/tmp/100x-test-';
+const XDG_CACHE_HOME = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+const CACHE_DIR = path.join(XDG_CACHE_HOME, '100xsystems');
+const TMP_DIR_REGISTRY = path.join(CACHE_DIR, 'test-tmp-dirs.json');
+const NPM_CACHE_DIR = path.join(CACHE_DIR, 'test-node-modules');
+
 const EXCLUDED_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next',
   '.cache', 'coverage', 'target', 'out', '.100x',
@@ -56,11 +81,12 @@ export class TestRunnerExecutor implements Executor {
   type = 'test-runner';
 
   async execute(params: Record<string, any>, ctx: ExecutorContext): Promise<ExecutorResult> {
+    // Clean up stale temp dirs from previous runs
+    this.cleanupStaleTempDirs();
+
     const framework = (params.framework as string) || 'vitest';
     const testFile = (params.test_file as string);
     const timeout = (params.timeout as number) || 120000;
-    const expectedPasses = params.expected_passes as number | undefined;
-
     if (!testFile) {
       return {
         check: 'test-runner',
@@ -81,6 +107,11 @@ export class TestRunnerExecutor implements Executor {
         details: `Looking for test file at: ${testFilePath}`,
       };
     }
+
+    // Auto-detect expected_passes from the test file if not specified in frontmatter
+    const expectedPasses = params.expected_passes !== undefined
+      ? (params.expected_passes as number)
+      : this.countTestCases(testFilePath);
 
     switch (framework) {
       case 'vitest':
@@ -109,6 +140,7 @@ export class TestRunnerExecutor implements Executor {
     opts: { timeout: number; expectedPasses?: number },
   ): Promise<ExecutorResult> {
     const tmpDir = await this.createTempDir('vitest');
+    this.registerTempDir(tmpDir);
     let cleanup = true;
 
     try {
@@ -122,36 +154,21 @@ export class TestRunnerExecutor implements Executor {
       // Step 3: Inject test-suite dependency into package.json
       // The lesson test files import from @100xsystems/test-suite-* (which re-exports vitest),
       // not from vitest directly. This package pulls in vitest as a dependency.
-      this.ensureDependency(tmpDir, '@100xsystems/test-suite-typescript', '^0.1.0');
+      this.ensureDependency(tmpDir, '@100xsystems/test-suite-typescript', '^0.1.1');
 
       // Step 4: Create a minimal vitest.config.ts if none exists
       this.ensureVitestConfig(tmpDir);
 
-      // Step 5: Install vitest (fast from npm cache)
-      const installResult = await execa('npm', ['install', '--no-audit', '--no-fund'], {
-        cwd: tmpDir,
-        timeout: opts.timeout,
-        reject: false,
-        stdio: 'pipe',
-      });
+      // Step 5: Install dependencies — use cached node_modules when possible
+      const installResult = await this.installDependenciesCached(tmpDir, opts.timeout);
 
-      if (installResult.exitCode !== 0) {
-        // Try with --legacy-peer-deps if it fails
-        const retryResult = await execa('npm', ['install', '--legacy-peer-deps', '--no-audit', '--no-fund'], {
-          cwd: tmpDir,
-          timeout: opts.timeout,
-          reject: false,
-          stdio: 'pipe',
-        });
-        if (retryResult.exitCode !== 0) {
-          return {
-            check: 'test-runner:vitest',
-            status: 'error',
-            message: 'Failed to install dependencies for test execution',
-            details: (retryResult.stderr || retryResult.stdout).slice(0, 500),
-            category: 'test',
-          };
-        }
+      if (!installResult) {
+        return {
+          check: 'test-runner:vitest',
+          status: 'error',
+          message: 'Failed to install dependencies for test execution',
+          category: 'test',
+        };
       }
 
       // Step 6: Run vitest with JSON reporter
@@ -235,12 +252,12 @@ export class TestRunnerExecutor implements Executor {
       const numFailed = assertions.filter((a: any) => a.status === 'failed').length;
       const totalTests = assertions.length;
 
-      // Check expected passes if specified
-      if (opts.expectedPasses !== undefined && numPassed < opts.expectedPasses) {
+      // Check expected passes (auto-detected or from frontmatter)
+      if (numPassed < (opts.expectedPasses ?? totalTests)) {
         return {
           check: 'test-runner:vitest',
           status: 'fail',
-          message: `${numPassed}/${opts.expectedPasses} tests passed (expected ${opts.expectedPasses})`,
+          message: `${numPassed}/${opts.expectedPasses ?? totalTests} tests passed (expected ${opts.expectedPasses ?? totalTests})`,
           details: this.formatAssertionResults(assertions),
           category: 'test',
         };
@@ -333,13 +350,168 @@ export class TestRunnerExecutor implements Executor {
     };
   }
 
+  /**
+   * Count test cases in a test file by parsing it() and test() call expressions.
+   * Handles both `it('name', ...)` and `test('name', ...)` patterns, including
+   * escaped quotes, template literals, and multi-line expressions.
+   *
+   * This is used to auto-detect expected_passes when the frontmatter doesn't
+   * explicitly set it. It counts top-level it/test calls, including those
+   * inside describe blocks.
+   */
+  private countTestCases(testFilePath: string): number {
+    try {
+      const content = fs.readFileSync(testFilePath, 'utf-8');
+      // Match it('...') or it("...") or test('...') or test("...")
+      // Handles escaped quotes, template literals, nested parentheses
+      const regex = /\b(?:it|test)\s*\(\s*(?:`[^`]*`|'[^']*'|"[^"]*"|[^,)]+)/g;
+      const matches = content.match(regex);
+      return matches ? matches.length : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────
 
   private async createTempDir(label: string): Promise<string> {
-    const suffix = randomBytes(4).toString('hex');
+    const suffix = crypto.randomBytes(4).toString('hex');
     const tmpDir = `${TEMP_BASE}${label}-${suffix}`;
     await fs.promises.mkdir(tmpDir, { recursive: true });
     return tmpDir;
+  }
+
+  /**
+   * Register a temp directory in the persistent registry so it can be
+   * cleaned up if the process is killed before cleanup runs.
+   */
+  private registerTempDir(tmpDir: string): void {
+    try {
+      let registry: Record<string, number> = {};
+      if (fs.existsSync(TMP_DIR_REGISTRY)) {
+        try {
+          registry = JSON.parse(fs.readFileSync(TMP_DIR_REGISTRY, 'utf-8'));
+        } catch {
+          registry = {};
+        }
+      }
+      registry[tmpDir] = Date.now();
+      fs.mkdirSync(path.dirname(TMP_DIR_REGISTRY), { recursive: true });
+      fs.writeFileSync(TMP_DIR_REGISTRY, JSON.stringify(registry, null, 2));
+    } catch {
+      // Best-effort tracking
+    }
+  }
+
+  /**
+   * Clean up stale temp directories from the registry that are older than
+   * the specified age (default: 1 hour). This runs on executor startup to
+   * prevent /tmp/100x-test-* accumulation from killed processes.
+   */
+  private cleanupStaleTempDirs(maxAgeMs = 3_600_000): void {
+    try {
+      if (!fs.existsSync(TMP_DIR_REGISTRY)) return;
+      const registry: Record<string, number> = JSON.parse(
+        fs.readFileSync(TMP_DIR_REGISTRY, 'utf-8')
+      );
+      const now = Date.now();
+      const updated: Record<string, number> = {};
+      for (const [dir, timestamp] of Object.entries(registry)) {
+        if (now - timestamp > maxAgeMs) {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true });
+          } catch {
+            // Already cleaned up or permission denied
+          }
+        } else {
+          updated[dir] = timestamp;
+        }
+      }
+      fs.writeFileSync(TMP_DIR_REGISTRY, JSON.stringify(updated, null, 2));
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+
+  /**
+   * Install npm dependencies with caching.
+   *
+   * Strategy: maintain a warm node_modules cache at NPM_CACHE_DIR. On each
+   * run, create a hash of the package.json dependencies, and if a matching
+   * cached node_modules exists, symlink/copy it. This avoids 30-60s npm
+   * install on every validation.
+   *
+   * Returns true if install succeeded, false otherwise.
+   */
+  private async installDependenciesCached(tmpDir: string, timeout: number): Promise<boolean> {
+    // Compute a hash of the dependency manifest
+    const pkgPath = path.join(tmpDir, 'package.json');
+    let depsHash = 'no-deps';
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      const deps = JSON.stringify({
+        dependencies: pkg.dependencies || {},
+        devDependencies: pkg.devDependencies || {},
+      });
+      depsHash = crypto.createHash('md5').update(deps).digest('hex').slice(0, 12);
+    } catch {
+      // No package.json — nothing to install
+      return true;
+    }
+
+    const cacheTarget = path.join(NPM_CACHE_DIR, depsHash);
+    const nodeModulesDir = path.join(tmpDir, 'node_modules');
+
+    // Check if we have a cached version
+    if (fs.existsSync(cacheTarget)) {
+      try {
+        // Use symlink for speed (works on macOS/Linux)
+        fs.symlinkSync(cacheTarget, nodeModulesDir, 'dir');
+        return true;
+      } catch {
+        // Symlink failed (e.g., cross-device on some systems), fall through to install
+      }
+    }
+
+    // No cache hit — run npm install
+    const installResult = await execa('npm', ['install', '--no-audit', '--no-fund'], {
+      cwd: tmpDir,
+      timeout,
+      reject: false,
+      stdio: 'pipe',
+    });
+
+    if (installResult.exitCode === 0) {
+      // Cache the result
+      try {
+        fs.mkdirSync(NPM_CACHE_DIR, { recursive: true });
+        // Copy installed node_modules to cache (can't move — install created it)
+        execaSync('cp', ['-r', nodeModulesDir, cacheTarget], { timeout: 30_000 });
+      } catch {
+        // Caching is best-effort
+      }
+      return true;
+    }
+
+    // Try with --legacy-peer-deps
+    const retryResult = await execa('npm', ['install', '--legacy-peer-deps', '--no-audit', '--no-fund'], {
+      cwd: tmpDir,
+      timeout,
+      reject: false,
+      stdio: 'pipe',
+    });
+
+    if (retryResult.exitCode === 0) {
+      try {
+        fs.mkdirSync(NPM_CACHE_DIR, { recursive: true });
+        execaSync('cp', ['-r', nodeModulesDir, cacheTarget], { timeout: 30_000 });
+      } catch {
+        // Best-effort
+      }
+      return true;
+    }
+
+    return false;
   }
 
   /**

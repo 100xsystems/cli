@@ -127,8 +127,12 @@ ${scaffold.description}
 `;
 }
 
-// ─── Lesson Frontmatter Generator ───────────────────────────────────
+// ─── Lesson Frontmatter + Test Generator ──────────────────────────
 
+/**
+ * Generate a lesson's lesson.md with proper frontmatter and content.
+ * Now includes the validation: block with auto-detected test-runner config.
+ */
 function generateLessonFrontmatter(lesson: LessonScaffold, moduleSlug: string, trackSlug: string): string {
   return `---
 title: "${lesson.title}"
@@ -138,6 +142,11 @@ difficulty: ${lesson.difficulty || 'Intermediate'}
 estimated_time: "${lesson.estimated_time || '30 minutes'}"
 knowledge_refs: [${lesson.knowledge_refs.map((r) => `"${r}"`).join(', ')}]
 prerequisites: []
+validation:
+  - type: test-runner
+    test_file: "tests/behavior.test.ts"
+    framework: vitest
+    timeout: 120000
 ---
 
 # ${lesson.title}
@@ -165,6 +174,35 @@ ${lesson.description}
 <!-- Summarize what was learned -->
 `;
 }
+
+/**
+ * Generate a boilerplate behavior.test.ts file for a new lesson.
+ * Pre-populated with imports from @100xsystems/test-suite-typescript.
+ */
+function generateLessonTestFile(lesson: LessonScaffold): string {
+  const testName = lesson.title.replace(/[^a-zA-Z0-9\s]/g, '').trim();
+  const testDescription = `should have required project files for ${testName.toLowerCase()}`;
+
+  return `import { describe, it, expect, fileExists, readJson, expectBuildSucceeds } from '@100xsystems/test-suite-typescript';
+
+describe('${testName}', () => {
+  it('${testDescription}', () => {
+    expect(fileExists('package.json')).toBe(true);
+    expect(fileExists('tsconfig.json')).toBe(true);
+  });
+
+  it('has valid package.json with build script', () => {
+    const pkg = readJson('package.json');
+    expect(pkg.scripts?.build).toBeDefined();
+  });
+
+  it('builds successfully', () => {
+    expectBuildSucceeds();
+  });
+});
+`;
+}
+
 
 // ─── Init System — Creates the full directory structure ───────────
 
@@ -203,11 +241,27 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
       filesCreated.push(moduleDir + '/');
 
       for (const lesson of mod.lessons) {
-        const lessonSlug = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
+        const lessonFolderName = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
+        const lessonDir = path.join(moduleDir, lessonFolderName);
+        fs.mkdirSync(lessonDir, { recursive: true });
+        filesCreated.push(lessonDir + '/');
+
+        // Create tests/ subdirectory
+        const testsDir = path.join(lessonDir, 'tests');
+        fs.mkdirSync(testsDir, { recursive: true });
+        filesCreated.push(testsDir + '/');
+
+        // Write lesson.md
         const lessonContent = generateLessonFrontmatter(lesson, moduleSlug, track.slug);
-        const lessonPath = path.join(moduleDir, `${lessonSlug}.md`);
+        const lessonPath = path.join(lessonDir, 'lesson.md');
         fs.writeFileSync(lessonPath, lessonContent);
         filesCreated.push(lessonPath);
+
+        // Write tests/behavior.test.ts
+        const testContent = generateLessonTestFile(lesson);
+        const testPath = path.join(testsDir, 'behavior.test.ts');
+        fs.writeFileSync(testPath, testContent);
+        filesCreated.push(testPath);
       }
     }
   }
@@ -278,7 +332,7 @@ export function addTrack(
   return { systemDir: trackDir, filesCreated, trackSlug };
 }
 
-// ─── Add Lesson to Existing Track ───────────────────────────────────
+// ─── Add Lesson to Existing Track — Folder-based with tests/ ────────
 
 export function addLesson(
   systemSlug: string,
@@ -304,13 +358,30 @@ export function addLesson(
   fs.mkdirSync(moduleDir, { recursive: true });
   filesCreated.push(moduleDir + '/');
 
-  const lessonSlug = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
+  // Create folder-based lesson structure: lesson-name/lesson.md + tests/behavior.test.ts
+  const lessonFolderName = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
+  const lessonDir = path.join(moduleDir, lessonFolderName);
+  fs.mkdirSync(lessonDir, { recursive: true });
+  filesCreated.push(lessonDir + '/');
+
+  // Create tests/ subdirectory
+  const testsDir = path.join(lessonDir, 'tests');
+  fs.mkdirSync(testsDir, { recursive: true });
+  filesCreated.push(testsDir + '/');
+
+  // Write lesson.md
   const lessonContent = generateLessonFrontmatter(lesson, moduleSlug, trackSlug);
-  const lessonPath = path.join(moduleDir, `${lessonSlug}.md`);
+  const lessonPath = path.join(lessonDir, 'lesson.md');
   fs.writeFileSync(lessonPath, lessonContent);
   filesCreated.push(lessonPath);
 
-  return { systemDir: moduleDir, filesCreated };
+  // Write tests/behavior.test.ts (boilerplate from shared package)
+  const testContent = generateLessonTestFile(lesson);
+  const testPath = path.join(testsDir, 'behavior.test.ts');
+  fs.writeFileSync(testPath, testContent);
+  filesCreated.push(testPath);
+
+  return { systemDir: lessonDir, filesCreated };
 }
 
 // ─── Verify Curriculum Access ───────────────────────────────────────
