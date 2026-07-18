@@ -21,6 +21,8 @@ import { readProjectConfig, PROJECT_CONFIG } from '../scaffold/index.js';
 import { runValidation } from '../actions/validate.js';
 import type { ValidationResult } from '../actions/validate.js';
 import { getSystemTracks, getTrackModules } from '../reader/lesson-reader.js';
+import { ensureAuthenticated } from '../auth/index.js';
+import { API_BASE_URL } from '../config.js';
 
 export const args = zod.tuple([]);
 
@@ -228,9 +230,34 @@ function ValidatingRunner({
 
       let advanced = false;
       if (failed === 0) {
-        // Update progress
+        // Update progress locally
         updateProgress(phase.config, phase.lessonSlug);
         advanced = true;
+
+        // Sync validation to server
+        try {
+          const auth = await ensureAuthenticated();
+          if (auth.token) {
+            const config = phase.config;
+            const sysSlug = (config.system as string) || '';
+            const trackSlug = (config.track as string) || '';
+            await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${auth.token}`,
+              },
+              body: JSON.stringify({
+                system_slug: sysSlug,
+                track_slug: trackSlug,
+                lesson_slug: phase.lessonSlug,
+                is_validated: true,
+              }),
+            });
+          }
+        } catch {
+          console.warn('  ⚠️  Failed to sync validation to server');
+        }
       }
 
       setPhase({

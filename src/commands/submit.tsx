@@ -6,7 +6,7 @@ import SelectInput from '../ui/SelectInput.js';
 import zod from 'zod';
 import {
   readSubmitConfig,
-  authenticateGitHub,
+  authenticateGitHubWithToken,
   detectGitRemote,
   buildReviewPackage,
   updateSubmissionsIndex,
@@ -14,10 +14,10 @@ import {
   isInsideMonorepo,
 } from '../actions/submit.js';
 import type { SubmitAnswers, BuildResult } from '../actions/submit.js';
-import type { PrResult } from '../actions/submit-pr.js';
 import { runValidation } from '../actions/validate.js';
 import type { ValidationResult } from '../actions/validate.js';
 import { getSystemTracks, getTrackModules } from '../reader/lesson-reader.js';
+import { API_BASE_URL } from '../config.js';
 
 export const args = zod.tuple([
   zod.string().optional().describe('Optional system slug (auto-detected from 100xsystems.json)'),
@@ -41,8 +41,9 @@ type SubmitPhase =
   | { name: 'auth'; ctx: SharedContext }
   | { name: 'metadata'; ctx: SharedContext; user: string; defaultRepoUrl: string | null }
   | { name: 'building'; ctx: SharedContext; answers: SubmitAnswers; user: string }
-  | { name: 'creating-pr'; ctx: SharedContext; buildResult: BuildResult }
-  | { name: 'done'; result: BuildResult; prResult: PrResult | null };
+  | { name: 'submission-link'; ctx: SharedContext; buildResult: BuildResult; user: string }
+  | { name: 'submitting'; ctx: SharedContext; buildResult: BuildResult; submissionLink: string; liveLink?: string; user: string }
+  | { name: 'done'; result: BuildResult; submissionLink: string; liveLink?: string };
 
 export default function Submit({ args }: Props) {
   const [systemSlug] = args;
@@ -66,38 +67,25 @@ export default function Submit({ args }: Props) {
       const systemTitle = (config.systemTitle as string) || slug;
       const ctx: SharedContext = { config, slug, projectDir, systemTitle };
 
-      // Run validation
       const results = await runValidation(projectDir, config);
 
-      // Check lesson completeness from .100x.json
-      if (slug) {
-        const progress = config.progress || {};
-        const completed: string[] = progress.completedLessons || [];
-        const currentLesson: string = progress.currentLesson || '';
-        const trackSlug = (config.track as string) || '';
+      const progress = config.progress || {};
+      const completed: string[] = progress.completedLessons || [];
+      const trackSlug = (config.track as string) || '';
 
-        if (trackSlug) {
-          const modules = getTrackModules(slug, trackSlug);
-          const allLessons = modules.flatMap(m => m.lessons);
-          if (allLessons.length > 0) {
-            const lastLesson = allLessons[allLessons.length - 1];
-            const allCompleted = allLessons.every(l => completed.includes(l.slug));
-            if (!allCompleted && lastLesson) {
-              results.unshift({
-                check: 'completeness',
-                status: 'warn',
-                message: `Not all lessons completed. ${completed.length}/${allLessons.length} done. Complete all lessons before submitting.`,
-                category: 'validation',
-              });
-            }
+      if (trackSlug) {
+        const modules = getTrackModules(slug, trackSlug);
+        const allLessons = modules.flatMap(m => m.lessons);
+        if (allLessons.length > 0) {
+          const allCompleted = allLessons.every(l => completed.includes(l.slug));
+          if (!allCompleted) {
+            results.unshift({
+              check: 'completeness',
+              status: 'warn',
+              message: `Not all lessons completed. ${completed.length}/${allLessons.length} done.`,
+              category: 'validation',
+            });
           }
-        } else if (currentLesson) {
-          results.unshift({
-            check: 'completeness',
-            status: 'warn',
-            message: 'No track configured. Run `100x init` to set up a track.',
-            category: 'validation',
-          });
         }
       }
 
@@ -112,8 +100,7 @@ export default function Submit({ args }: Props) {
       setPhase({ name: 'error', message: 'Submission cancelled.' });
       return;
     }
-    // Steal ctx from the current confirm phase
-    setPhase(p => {
+    setPhase((p) => {
       if (p.name !== 'confirm') return p;
       return { name: 'auth', ctx: p.ctx };
     });
@@ -126,10 +113,12 @@ export default function Submit({ args }: Props) {
 
     (async () => {
       try {
-        const user = await authenticateGitHub();
-        const ctx = (phase as Extract<SubmitPhase, { name: 'auth' }>).ctx;
-        const defaultRepoUrl = detectGitRemote(ctx.projectDir);
-        setPhase({ name: 'metadata', ctx, user, defaultRepoUrl });
+        const auth = await authenticateGitHubWithToken();
+        const p = phase as Extract<SubmitPhase, { name: 'auth' }>;
+        const defaultRepoUrl = detectGitRemote(p.ctx.projectDir);
+        setPhase({ name: 'metadata', ctx: p.ctx, user: auth.user, defaultRepoUrl });
+        // Store token in context for later use
+        (p.ctx as any)._token = auth.token;
       } catch (err: any) {
         setPhase({ name: 'error', message: `Authentication failed: ${err.message}` });
       }
@@ -139,13 +128,13 @@ export default function Submit({ args }: Props) {
   // ─── Metadata → Building transition ────────────────────────────
 
   const handleMetadata = useCallback((answers: SubmitAnswers) => {
-    setPhase(p => {
+    setPhase((p) => {
       if (p.name !== 'metadata') return p;
       return { name: 'building', ctx: p.ctx, answers, user: p.user };
     });
   }, []);
 
-  // ─── Building → Creating PR transition ───────────────────────────
+  // ─── Building → Submission Link transition ─────────────────────
 
   useEffect(() => {
     if (phase.name !== 'building') return;
@@ -157,37 +146,63 @@ export default function Submit({ args }: Props) {
         const { projectDir, slug } = p.ctx;
         const result = buildReviewPackage(projectDir, slug, user, answers);
         updateSubmissionsIndex(slug, result.metadata);
-        setPhase({ name: 'creating-pr', ctx: p.ctx, buildResult: result });
+        setPhase({ name: 'submission-link', ctx: p.ctx, buildResult: result, user });
       } catch (err: any) {
         setPhase({ name: 'error', message: `Failed to build review package: ${err.message}` });
       }
     })();
   }, [phase]);
 
-  // ─── Creating PR → Done transition ───────────────────────────────
+  // ─── Handle submission link input → API call ───────────────────
+
+  const handleSubmissionLink = useCallback((link: string, liveLink?: string) => {
+    setPhase((p) => {
+      if (p.name !== 'submission-link') return p;
+      return { name: 'submitting', ctx: p.ctx, buildResult: p.buildResult, submissionLink: link, liveLink, user: p.user };
+    });
+  }, []);
+
+  // ─── Call API to record submission ─────────────────────────────
 
   useEffect(() => {
-    if (phase.name !== 'creating-pr') return;
+    if (phase.name !== 'submitting') return;
 
     (async () => {
       try {
-        const p = phase as Extract<SubmitPhase, { name: 'creating-pr' }>;
-        const { buildResult } = p;
+        const p = phase as Extract<SubmitPhase, { name: 'submitting' }>;
+        const { submissionLink, liveLink, user } = p;
+        // Use the stored auth token from the metadata phase
+        const token = (p.ctx as any)._token || '';
+        const config = p.ctx.config;
+        const trackSlug = (config.track as string) || '';
+        const progress = config.progress || {};
+        const completed: string[] = progress.completedLessons || [];
+        const lastLesson = completed.length > 0 ? completed[completed.length - 1] : '';
 
-        // Try to create the PR; gracefully fall back if it fails
-        let prResult: PrResult | null = null;
-        try {
-          const { submitPullRequest } = await import('../actions/submit-pr.js');
-          prResult = await submitPullRequest(buildResult);
-          markProjectCompleted(buildResult.slug);
-        } catch (prErr: any) {
-          // PR creation failed — still mark as done with manual instructions
-          console.error(`  PR creation failed: ${prErr.message}`);
+        // Call the server API to record the submission with proper OAuth token
+        const response = await fetch(`${API_BASE_URL}/api/cli/submit`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            systemSlug: p.ctx.slug,
+            trackSlug,
+            lessonSlug: lastLesson,
+            submissionLink,
+            liveLink: liveLink || undefined,
+          }),
+        });
+
+        if (!response.ok) {
+          console.error(`  ⚠️  Failed to record submission on server: ${response.statusText}`);
         }
 
-        setPhase({ name: 'done', result: buildResult, prResult });
+        markProjectCompleted(p.ctx.slug);
+        setPhase({ name: 'done', result: p.buildResult, submissionLink, liveLink });
       } catch (err: any) {
-        setPhase({ name: 'error', message: `PR creation failed: ${err.message}` });
+        setPhase({ name: 'error', message: `Failed to submit: ${err.message}` });
       }
     })();
   }, [phase]);
@@ -196,7 +211,7 @@ export default function Submit({ args }: Props) {
 
   useEffect(() => {
     if (phase.name === 'done') {
-      const timer = setTimeout(() => exit(), 2000);  // Longer delay so user can see PR URL
+      const timer = setTimeout(() => exit(), 5000);
       return () => clearTimeout(timer);
     }
   }, [phase, exit]);
@@ -246,13 +261,9 @@ export default function Submit({ args }: Props) {
   if (phase.name === 'auth') {
     return (
       <Box flexDirection="column" paddingX={2}>
-        <StepIndicator steps={3} current={1} labels={{ 1: 'Auth', 2: 'Meta', 3: 'Build' }} />
-        <Box marginY={1} />
         <Text>
-          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Step 1/3:</Text> Authenticating with GitHub...
+          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Authenticating with GitHub...</Text>
         </Text>
-        <Box marginY={1} />
-        <Text dimColor>    A browser window will open for GitHub authorization.</Text>
       </Box>
     );
   }
@@ -260,8 +271,6 @@ export default function Submit({ args }: Props) {
   if (phase.name === 'metadata') {
     return (
       <Box flexDirection="column" paddingX={2}>
-        <Text bold>{'  '}Step 2/3: Gathering submission metadata</Text>
-        <Box marginY={1} />
         <MetadataForm
           defaultRepoUrl={phase.defaultRepoUrl || ''}
           defaultLanguage={(() => {
@@ -280,37 +289,35 @@ export default function Submit({ args }: Props) {
   if (phase.name === 'building') {
     return (
       <Box flexDirection="column" paddingX={2}>
-        <StepIndicator steps={4} current={3} labels={{ 1: 'Auth', 2: 'Meta', 3: 'Build', 4: 'PR' }} />
-        <Box marginY={1} />
         <Text>
-          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Step 3/4:</Text> Building review package...
+          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Building review package...</Text>
         </Text>
-        <Box marginY={1}>
-          <Text dimColor>    Packaging project files, generating diffs, and preparing metadata...</Text>
-        </Box>
       </Box>
     );
   }
 
-  if (phase.name === 'creating-pr') {
+  if (phase.name === 'submission-link') {
     return (
       <Box flexDirection="column" paddingX={2}>
-        <StepIndicator steps={4} current={4} labels={{ 1: 'Auth', 2: 'Meta', 3: 'Build', 4: 'PR' }} />
+        <Text bold color="green">{'  '}✓ Review package built!</Text>
         <Box marginY={1} />
+        <SubmissionLinkForm onSubmit={handleSubmissionLink} />
+      </Box>
+    );
+  }
+
+  if (phase.name === 'submitting') {
+    return (
+      <Box flexDirection="column" paddingX={2}>
         <Text>
-          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Step 4/4:</Text> Creating Pull Request...
+          {'  '}<Spinner type="dots" />{' '}<Text dimColor>Recording submission on server...</Text>
         </Text>
-        <Box marginY={1}>
-          <Text dimColor>
-            {'    '}Forking repository, copying review package, committing, and opening PR...
-          </Text>
-        </Box>
       </Box>
     );
   }
 
   if (phase.name === 'done') {
-    return <DoneScreen result={phase.result} prResult={phase.prResult} />;
+    return <DoneScreen result={phase.result} submissionLink={phase.submissionLink} liveLink={phase.liveLink} />;
   }
 
   return null;
@@ -384,8 +391,48 @@ function MetadataForm({
         defaultValue={difficulty}
         onSubmit={(value) => {
           setDifficulty(value);
-          // Use setTimeout(0) to let the state settle before calling onComplete
           setTimeout(() => onComplete({ repositoryUrl: repoUrl, language, difficulty: value }), 0);
+        }}
+      />
+    );
+  }
+
+  return null;
+}
+
+// ─── Submission Link Form ───────────────────────────────────────────
+
+function SubmissionLinkForm({
+  onSubmit,
+}: {
+  onSubmit: (link: string, liveLink?: string) => void;
+}) {
+  const [step, setStep] = useState<'submission-link' | 'live-link'>('submission-link');
+  const [submissionLink, setSubmissionLink] = useState('');
+
+  if (step === 'submission-link') {
+    return (
+      <TextInput
+        message="Paste your submission URL (GitHub repo, PR, or hosted project):"
+        defaultValue=""
+        placeholder="https://github.com/your-username/your-implementation"
+        validate={(v: string) => v.length > 0 ? true : 'Submission URL is required'}
+        onSubmit={(value) => {
+          setSubmissionLink(value);
+          setStep('live-link');
+        }}
+      />
+    );
+  }
+
+  if (step === 'live-link') {
+    return (
+      <TextInput
+        message="(Optional) Paste your live project URL, or press Enter to skip:"
+        defaultValue=""
+        placeholder="https://your-app.vercel.app"
+        onSubmit={(value) => {
+          onSubmit(submissionLink, value || undefined);
         }}
       />
     );
@@ -396,121 +443,24 @@ function MetadataForm({
 
 // ─── Done Screen ────────────────────────────────────────────────────
 
-function DoneScreen({ result, prResult }: { result: BuildResult; prResult: PrResult | null }) {
-  const inMonorepo = isInsideMonorepo();
-
+function DoneScreen({ result, submissionLink, liveLink }: { result: BuildResult; submissionLink: string; liveLink?: string }) {
   const children: React.ReactNode[] = [];
 
-  if (prResult) {
-    // PR was created successfully
-    children.push(<Text key="h" color="green">{'  '}✓ Pull Request created successfully!</Text>);
-    children.push(<Box key="sp0" marginY={1} />);
-    children.push(
-      <Text key="pr-link">
-        {'  '}→ <Text color="cyan" bold>{prResult.prUrl}</Text>
-      </Text>
-    );
-    children.push(<Box key="sp1" marginY={1} />);
-    children.push(
-      <Text key="pr-note" dimColor>
-        {'  '}A reviewer will review your submission. Track the PR for updates.
-      </Text>
-    );
-  } else {
-    // PR creation failed or unavailable — show manual instructions
-    children.push(<Text key="h2" color="green">{'  '}✓ Review package built successfully!</Text>);
-    children.push(<Box key="sp2" marginY={1} />);
-
-    if (inMonorepo) {
-      children.push(
-        <Text key="manual1" dimColor>{'  '}PR automation requires authentication with GitHub.</Text>
-      );
-      children.push(<Box key="sp3" marginY={1} />);
-      children.push(
-        <Text key="manual2">{'  '}Create a manual PR from your fork:</Text>
-      );
-      children.push(<Box key="sp4" marginY={1} />);
-      children.push(
-        <Box key="manual-cmds" marginLeft={4} flexDirection="column">
-          <Text dimColor>git checkout -b submission/{result.slug}/{result.reviewDirName}</Text>
-          <Text dimColor>git add submissions/{result.slug}/{result.reviewDirName}</Text>
-          <Text dimColor>git commit -m &ldquo;submission: {result.slug} by {result.user}&rdquo;</Text>
-          <Text dimColor>git push origin submission/{result.slug}/{result.reviewDirName}</Text>
-        </Box>
-      );
-      children.push(<Box key="sp5" marginY={1} />);
-      children.push(
-        <Text key="manual-pr">{'  '}Then create a PR at:</Text>
-      );
-      children.push(
-        <Text key="manual-pr-link" color="cyan">
-          {'  '}https://github.com/100xsystems/submissions/compare
-        </Text>
-      );
-    } else {
-      children.push(
-        <Text key="manual3" dimColor>
-          {'  '}To submit, push your repository and create a PR to 100xsystems/submissions.
-        </Text>
-      );
-    }
+  children.push(<Text key="h" color="green">{'  '}✓ Submission recorded successfully!</Text>);
+  children.push(<Box key="sp0" marginY={1} />);
+  children.push(<Text key="sl">{'  '}Submission URL: <Text bold color="cyan">{submissionLink}</Text></Text>);
+  if (liveLink) {
+    children.push(<Text key="ll">{'  '}Live URL: <Text bold color="cyan">{liveLink}</Text></Text>);
   }
+  children.push(<Box key="sp1" marginY={1} />);
 
-  // Submission details
-  children.push(<Box key="sp6" marginY={1} />);
   children.push(<Text key="details-h" dimColor>{'  '}Submission details:</Text>);
   children.push(<Text key="d1">{'  '}System: <Text bold>{result.slug}</Text></Text>);
   children.push(<Text key="d2">{'  '}Author: <Text bold>{result.user}</Text></Text>);
   children.push(<Text key="d3">{'  '}Language: <Text bold>{result.metadata.language}</Text></Text>);
   children.push(<Text key="d4">{'  '}Repository: <Text bold>{result.metadata.repositoryUrl}</Text></Text>);
-  if (prResult?.prNumber) {
-    children.push(<Text key="d5">{'  '}PR: <Text bold>#{prResult.prNumber}</Text></Text>);
-  }
+  children.push(<Box key="sp2" marginY={1} />);
+  children.push(<Text key="note" dimColor>  Your submission has been recorded and is pending review.</Text>);
 
   return <Box flexDirection="column" paddingX={2}>{children}</Box>;
 }
-
-// ─── Step Indicator ─────────────────────────────────────────────────
-
-function StepIndicator({ steps, current, labels }: {
-  steps: number;
-  current: number;
-  labels: Record<number, string>;
-}) {
-  const circles = Array.from({ length: steps }, (_, i) => {
-    const num = i + 1;
-    if (num < current) {
-      return <Text key={num} color="green">  ●  </Text>;
-    }
-    if (num === current) {
-      return <Text key={num} color="cyan">  ◉  </Text>;
-    }
-    return <Text key={num} color="gray">  ○  </Text>;
-  });
-
-  return (
-    <Box flexDirection="column" paddingX={2}>
-      <Box flexDirection="row" alignItems="center">
-        {circles.map((circle, i) => (
-          <React.Fragment key={i}>
-            {circle}
-            {i < steps - 1 && <Text dimColor>━━━</Text>}
-          </React.Fragment>
-        ))}
-      </Box>
-      <Box flexDirection="row" marginLeft={1}>
-        {Array.from({ length: steps }, (_, i) => {
-          const num = i + 1;
-          return (
-            <Box key={num} width={num < steps ? 9 : 8}>
-              <Text dimColor={num !== current} color={num === current ? 'cyan' : undefined}>
-                {labels[num] || ''}
-              </Text>
-            </Box>
-          );
-        })}
-      </Box>
-    </Box>
-  );
-}
-

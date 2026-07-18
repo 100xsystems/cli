@@ -83,6 +83,14 @@ export async function authenticateGitHub(): Promise<string> {
 }
 
 /**
+ * Authenticate with GitHub and return both the access token and username.
+ */
+export async function authenticateGitHubWithToken(): Promise<{ token: string; user: string }> {
+  const auth = await ensureAuthenticated();
+  return { token: auth.token, user: auth.user };
+}
+
+/**
  * Detect the git remote URL for the project.
  */
 export function detectGitRemote(projectDir: string): string | null {

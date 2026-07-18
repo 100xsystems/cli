@@ -18,10 +18,11 @@ import path from 'path';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import { getAllSystems, systemExists, getSystemMeta } from '../reader/system-reader.js';
-import { getSystemTracks } from '../reader/lesson-reader.js';
+import { getSystemTracks, getTrackModules } from '../reader/lesson-reader.js';
+import { API_BASE_URL } from '../config.js';
 import { syncSystemFromRegistry, fetchRegistry } from '../reader/index.js';
 import { scaffoldProject } from '../scaffold/index.js';
-import { getCachedUser } from '../auth/index.js';
+import { getCachedUser, ensureAuthenticated } from '../auth/index.js';
 import { markInProgress } from '../actions/progress.js';
 
 export const args = zod.tuple([
@@ -303,6 +304,34 @@ async function doScaffold(
     });
 
     markInProgress(systemSlug, targetDir, trackSlug);
+
+    // Call server API to enroll the user (sync to website)
+    try {
+      const auth = await ensureAuthenticated();
+      if (auth.token) {
+        // Get the first lesson of the selected track
+        const modules = getTrackModules(systemSlug, trackSlug);
+        const allLessons = modules.flatMap(m => m.lessons);
+        const firstLessonSlug = allLessons[0]?.slug || 'lesson-intro-and-setup';
+
+        await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${auth.token}`,
+          },
+          body: JSON.stringify({
+            system_slug: systemSlug,
+            track_slug: trackSlug,
+            lesson_slug: firstLessonSlug,
+            lesson_type: 'lesson',
+          }),
+        });
+      }
+    } catch {
+      // Silently fail — enrollment sync is non-critical
+    }
+
     setPhase({ name: 'done', systemSlug, systemTitle: system.title, trackSlug, outputDir, created });
   } catch (err: any) {
     setPhase({ name: 'error', message: `Failed to create project: ${err.message}` });
