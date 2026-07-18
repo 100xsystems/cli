@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { authenticateWithPKCE, authenticateWithDeviceFlow } from './pkce-auth.js';
+import { authenticateWithDeviceFlow } from './pkce-auth.js';
 import type { AuthResult } from './pkce-auth.js';
 
 // ─── Token Storage ──────────────────────────────────────────────────
@@ -31,44 +31,35 @@ interface AuthToken {
  * Strategy:
  *   1. Check cached token on disk
  *   2. If valid, return cached token
- *   3. Otherwise, try PKCE loopback (browser-based, like Windsurf/Devin)
- *   4. If PKCE fails (headless), fall back to Device Flow (code entry)
- *   5. Cache the new token and return
+ *   3. Otherwise, authenticate via GitHub Device Flow (opens browser)
+ *   4. Cache the new token and return
  */
 export async function ensureAuthenticated(): Promise<{ token: string; user: string }> {
   const cached = loadCachedToken();
   if (cached?.accessToken) {
     if (cached.expiresAt && cached.expiresAt < Date.now()) {
       // Token expired — re-authenticate
-      return authenticateFallback();
+      return authenticateFresh();
     }
     return { token: cached.accessToken, user: cached.user?.login || 'unknown' };
   }
 
-  return authenticateFallback();
+  return authenticateFresh();
 }
 
 /**
- * Attempt PKCE loopback first, fall back to device flow.
+ * Authenticate from scratch using Device Flow (browser-based).
  */
-async function authenticateFallback(): Promise<{ token: string; user: string }> {
+async function authenticateFresh(): Promise<{ token: string; user: string }> {
   let result: AuthResult;
 
   try {
-    // Try the premium PKCE loopback flow (opens browser automatically, no code to type)
-    result = await authenticateWithPKCE();
-  } catch (pkceError) {
-    // PKCE failed — likely headless/CI environment.
-    // Fall back to Device Flow (user types a code in their browser).
-    try {
-      result = await authenticateWithDeviceFlow();
-    } catch (deviceError) {
-      throw new Error(
-        `Authentication failed.\n` +
-        `  PKCE loopback: ${(pkceError as Error).message}\n` +
-        `  Device flow:   ${(deviceError as Error).message}`
-      );
-    }
+    result = await authenticateWithDeviceFlow();
+  } catch (err) {
+    throw new Error(
+      `GitHub authentication failed.\n` +
+      `  ${(err as Error).message}`
+    );
   }
 
   // Cache the token with full user info
@@ -136,7 +127,7 @@ function saveTokenFromAuth(
     const authToken: AuthToken = {
       accessToken,
       tokenType: 'bearer',
-      scope: 'repo,user:email',
+      scope: 'user:email',
       createdAt: new Date().toISOString(),
       user: {
         login: userInfo?.login || login,
