@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { authenticateWithDeviceFlow } from './pkce-auth.js';
-import type { AuthResult } from './pkce-auth.js';
+import { authenticateWithDeviceFlow } from './device-auth.js';
+import type { AuthResult } from './device-auth.js';
 
 // ─── Token Storage ──────────────────────────────────────────────────
 
