@@ -69,6 +69,14 @@ export default function Init({ args, options }: Props) {
         return;
       }
 
+      // Authenticate FIRST — before any cloning or file operations
+      try {
+        await ensureAuthenticated();
+      } catch (err) {
+        setPhase({ name: 'error', message: `Authentication required: ${(err as Error).message}` });
+        return;
+      }
+
       // Sync systems from registry (best-effort)
       try {
         const registry = await fetchRegistry();
@@ -183,7 +191,7 @@ export default function Init({ args, options }: Props) {
         <Box flexDirection="column" marginLeft={2}>
           <Text>System: <Text bold>{phase.systemTitle}</Text></Text>
           <Text>Track:  <Text bold>{phase.trackTitle}</Text></Text>
-          <Text>Output: <Text bold>./{phase.systemSlug}-implementation</Text></Text>
+          <Text>Output: <Text bold>./{phase.systemSlug}-{phase.trackSlug}</Text></Text>
         </Box>
         <Box marginY={1} />
         <Box marginLeft={2}>
@@ -194,7 +202,7 @@ export default function Init({ args, options }: Props) {
             ]}
             onSelect={(item) => {
               if (item.value === 'yes') {
-                setPhase({ name: 'scaffolding', systemSlug: phase.systemSlug, systemTitle: phase.systemTitle, trackSlug: phase.trackSlug, trackTitle: phase.trackTitle, language: phase.language, outputDir: `./${phase.systemSlug}-implementation` });
+                setPhase({ name: 'scaffolding', systemSlug: phase.systemSlug, systemTitle: phase.systemTitle, trackSlug: phase.trackSlug, trackTitle: phase.trackTitle, language: phase.language,        outputDir: `./${phase.systemSlug}-${phase.trackSlug}` });
               } else {
                 setPhase({ name: 'error', message: 'Scaffolding cancelled.' });
               }
@@ -282,7 +290,7 @@ async function doScaffold(
   }
 
   const system = getSystemMeta(systemSlug)!;
-  const outputDir = outputOverride || `./${systemSlug}-implementation`;
+  const outputDir = outputOverride || `./${systemSlug}-${trackSlug}`;
   const targetDir = path.resolve(process.cwd(), outputDir);
 
   if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length > 0) {

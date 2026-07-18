@@ -56,15 +56,17 @@ export async function authenticateWithDeviceFlow(): Promise<AuthResult> {
     throw new Error(`GitHub error: ${deviceData.error_description || deviceData.error}`);
   }
 
-  // Step 2: Open browser with code pre-filled (seamless UX — user just clicks authorize)
+  // Always show the device code in the terminal, even when browser opens successfully
+  console.log(`  ${'→'.padEnd(3)} Device code: \x1b[1m${deviceData.user_code}\x1b[22m`);
+
+  // Open browser with code pre-filled (seamless UX — user just clicks authorize)
   const directUrl = `https://github.com/login/device?user_code=${deviceData.user_code}`;
   try {
     await open(directUrl, { wait: false });
-    console.log(`  ${'→'.padEnd(3)} Browser opened. Click "Authorize" to continue.`);
+    console.log(`  ${'→'.padEnd(3)} Browser opened. Authorize on GitHub to continue.`);
+    console.log(`  ${'→'.padEnd(3)} Or visit: ${deviceData.verification_uri} and enter the code above`);
   } catch {
-    // Fallback: show URL + code for manual entry
-    console.log(`  ${'→'.padEnd(3)} Open this URL in your browser:`);
-    console.log(`     ${deviceData.verification_uri}`);
+    console.log(`  ${'→'.padEnd(3)} Open: ${deviceData.verification_uri}`);
     console.log(`  ${'→'.padEnd(3)} Enter code: ${deviceData.user_code}`);
   }
 

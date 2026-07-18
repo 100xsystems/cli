@@ -69,23 +69,7 @@ function toSlug(str: string): string {
     .replace(/(^-|-$)/g, '');
 }
 
-function computeNextOrder(dir: string, prefix: string): number {
-  try {
-    if (!fs.existsSync(dir)) return 1;
-    const items = fs.readdirSync(dir);
-    let max = 0;
-    for (const item of items) {
-      const match = item.match(new RegExp(`^${prefix}(\\d+)`));
-      if (match) {
-        const num = parseInt(match[1], 10);
-        if (num > max) max = num;
-      }
-    }
-    return max + 1;
-  } catch {
-    return 1;
-  }
-}
+
 
 // ─── Index.md Generator ─────────────────────────────────────────────
 
@@ -131,9 +115,9 @@ ${scaffold.description}
 
 /**
  * Generate a lesson's lesson.md with proper frontmatter and content.
- * Now includes the validation: block with auto-detected test-runner config.
+ * Creates flat-format lessons (no module field).
  */
-function generateLessonFrontmatter(lesson: LessonScaffold, moduleSlug: string, trackSlug: string): string {
+function generateLessonFrontmatter(lesson: LessonScaffold): string {
   return `---
 title: "${lesson.title}"
 description: "${lesson.description}"
@@ -232,17 +216,9 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
   for (const track of scaffold.tracks) {
     const trackDir = path.join(systemDir, track.slug);
     fs.mkdirSync(trackDir, { recursive: true });
-    filesCreated.push(trackDir + '/');
-
-    for (const mod of track.modules) {
-      const moduleSlug = mod.slug || `module-${toSlug(mod.title)}`;
-      const moduleDir = path.join(trackDir, moduleSlug);
-      fs.mkdirSync(moduleDir, { recursive: true });
-      filesCreated.push(moduleDir + '/');
-
-      for (const lesson of mod.lessons) {
-        const lessonFolderName = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
-        const lessonDir = path.join(moduleDir, lessonFolderName);
+    filesCreated.push(trackDir + '/');      for (const lesson of track.modules.flatMap(m => m.lessons)) {
+        const lessonFolderName = `lesson-${toSlug(lesson.title)}`;
+        const lessonDir = path.join(trackDir, lessonFolderName);
         fs.mkdirSync(lessonDir, { recursive: true });
         filesCreated.push(lessonDir + '/');
 
@@ -252,7 +228,7 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
         filesCreated.push(testsDir + '/');
 
         // Write lesson.md
-        const lessonContent = generateLessonFrontmatter(lesson, moduleSlug, track.slug);
+        const lessonContent = generateLessonFrontmatter(lesson);
         const lessonPath = path.join(lessonDir, 'lesson.md');
         fs.writeFileSync(lessonPath, lessonContent);
         filesCreated.push(lessonPath);
@@ -263,7 +239,6 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
         fs.writeFileSync(testPath, testContent);
         filesCreated.push(testPath);
       }
-    }
   }
 
   return { systemDir, filesCreated };
@@ -293,13 +268,7 @@ export function addTrack(
   fs.mkdirSync(trackDir, { recursive: true });
   filesCreated.push(trackDir + '/');
 
-  // Create a default module
-  const moduleSlug = 'module-1-introduction';
-  const moduleDir = path.join(trackDir, moduleSlug);
-  fs.mkdirSync(moduleDir, { recursive: true });
-  filesCreated.push(moduleDir + '/');
-
-  // Create a default first lesson
+  // Create a default first lesson directly under track root (flat structure)
   const lesson: LessonScaffold = {
     title: `Introduction to ${trackTitle}`,
     order: 1,
@@ -309,18 +278,31 @@ export function addTrack(
     content: '',
   };
 
-  const lessonSlug = '01-lesson-introduction';
-  const lessonContent = generateLessonFrontmatter(lesson, moduleSlug, trackSlug);
-  const lessonPath = path.join(moduleDir, `${lessonSlug}.md`);
+  const lessonFolderName = 'lesson-introduction';
+  const lessonDir = path.join(trackDir, lessonFolderName);
+  fs.mkdirSync(lessonDir, { recursive: true });
+  filesCreated.push(lessonDir + '/');
+
+  // Create tests/ subdirectory
+  const testsDir = path.join(lessonDir, 'tests');
+  fs.mkdirSync(testsDir, { recursive: true });
+  filesCreated.push(testsDir + '/');
+
+  const lessonContent = generateLessonFrontmatter(lesson);
+  const lessonPath = path.join(lessonDir, 'lesson.md');
   fs.writeFileSync(lessonPath, lessonContent);
   filesCreated.push(lessonPath);
 
-  // Update index.md tracks list
+  const testContent = generateLessonTestFile(lesson);
+  const testPath = path.join(testsDir, 'behavior.test.ts');
+  fs.writeFileSync(testPath, testContent);
+  filesCreated.push(testPath);
+
+  // Update index.md tracks list (no modules field anymore)
   const indexMdPath = path.join(systemsDir, systemSlug, 'index.md');
   if (fs.existsSync(indexMdPath)) {
     let indexContent = fs.readFileSync(indexMdPath, 'utf-8');
-    // Add the new track to the frontmatter
-    const trackEntry = `  - slug: ${trackSlug}\n    title: "${trackTitle}"\n    language: ${language}\n    difficulty: ${difficulty}\n    modules:\n      - slug: ${moduleSlug}\n        title: "Introduction"`;
+    const trackEntry = `  - slug: ${trackSlug}\n    title: "${trackTitle}"\n    language: ${language}\n    difficulty: ${difficulty}`;
     indexContent = indexContent.replace(
       /tracks:\n/,
       `tracks:\n${trackEntry}\n`,
@@ -337,7 +319,7 @@ export function addTrack(
 export function addLesson(
   systemSlug: string,
   trackSlug: string,
-  moduleTitle: string,
+  moduleTitle: string, // kept for API compat, but lessons are now flat under track root
   lesson: LessonScaffold,
 ): ContributeResult {
   if (!systemExists(systemSlug)) {
@@ -352,15 +334,10 @@ export function addLesson(
   }
 
   const filesCreated: string[] = [];
-  const moduleSlug = `module-${computeNextOrder(trackDir, 'module-')}-${toSlug(moduleTitle)}`;
-  const moduleDir = path.join(trackDir, moduleSlug);
 
-  fs.mkdirSync(moduleDir, { recursive: true });
-  filesCreated.push(moduleDir + '/');
-
-  // Create folder-based lesson structure: lesson-name/lesson.md + tests/behavior.test.ts
-  const lessonFolderName = `${String(lesson.order).padStart(2, '0')}-lesson-${toSlug(lesson.title)}`;
-  const lessonDir = path.join(moduleDir, lessonFolderName);
+  // Create flat lesson structure directly under track root (no modules)
+  const lessonFolderName = `lesson-${toSlug(lesson.title)}`;
+  const lessonDir = path.join(trackDir, lessonFolderName);
   fs.mkdirSync(lessonDir, { recursive: true });
   filesCreated.push(lessonDir + '/');
 
@@ -370,7 +347,7 @@ export function addLesson(
   filesCreated.push(testsDir + '/');
 
   // Write lesson.md
-  const lessonContent = generateLessonFrontmatter(lesson, moduleSlug, trackSlug);
+  const lessonContent = generateLessonFrontmatter(lesson);
   const lessonPath = path.join(lessonDir, 'lesson.md');
   fs.writeFileSync(lessonPath, lessonContent);
   filesCreated.push(lessonPath);
