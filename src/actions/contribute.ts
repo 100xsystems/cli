@@ -319,7 +319,6 @@ export function addTrack(
 export function addLesson(
   systemSlug: string,
   trackSlug: string,
-  moduleTitle: string, // kept for API compat, but lessons are now flat under track root
   lesson: LessonScaffold,
 ): ContributeResult {
   if (!systemExists(systemSlug)) {

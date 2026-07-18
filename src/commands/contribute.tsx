@@ -153,7 +153,6 @@ export default function Contribute({ args, options }: Props) {
             const trackSlug = options.language
               ? `track-${options.language}`
               : 'track-typescript';
-            const moduleTitle = thirdArg || 'New Module';
             const lesson: LessonScaffold = {
               title: options.title || 'New Lesson',
               order: 1,
@@ -163,7 +162,7 @@ export default function Contribute({ args, options }: Props) {
               content: '',
             };
 
-            const res = addLesson(systemSlug, trackSlug, moduleTitle, lesson);
+            const res = addLesson(systemSlug, trackSlug, lesson);
             setResult(res);
             break;
           }
