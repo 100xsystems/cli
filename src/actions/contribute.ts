@@ -1,7 +1,7 @@
 /**
  * ## Contribute Action
  *
- * Scaffolds new curriculum content (systems, tracks, modules, lessons)
+ * Scaffolds new curriculum content (systems, tracks, lessons)
  * and optionally creates a Pull Request to 100xsystems/curriculum.
  *
  * Commands:
@@ -50,6 +50,7 @@ export interface LessonScaffold {
   description: string;
   estimated_time: string;
   difficulty?: string;
+  lesson_type?: string;
   knowledge_refs: string[];
   content: string;
 }
@@ -69,94 +70,57 @@ function toSlug(str: string): string {
     .replace(/(^-|-$)/g, '');
 }
 
+/**
+ * Compute the next available lesson number in a track directory
+ * by scanning existing NN-prefixed folders.
+ */
+function nextLessonNumber(trackDir: string): number {
+  if (!fs.existsSync(trackDir)) return 1;
+  try {
+    const entries = fs.readdirSync(trackDir, { withFileTypes: true });
+    let maxNum = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const match = entry.name.match(/^(\d+)/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num > maxNum) maxNum = num;
+      }
+    }
+    return maxNum + 1;
+  } catch {
+    return 1;
+  }
+}
 
+/**
+ * Generate a track index.md with ordered lesson listing.
+ */
+function generateTrackIndexMd(lessons: Array<{ slug: string; title: string; lesson_type: string }>): string {
+  const lessonsYaml = lessons.map((l) =>
+    `  - slug: "${l.slug}"\n    title: "${l.title}"\n    lesson_type: "${l.lesson_type || 'lesson'}"`
+  );
+  return `---\nlessons:\n${lessonsYaml.join('\n')}\n---\n`;
+}
 
 // ─── Index.md Generator ─────────────────────────────────────────────
 
 function generateSystemIndexMd(scaffold: SystemScaffold): string {
   const tracksYaml = scaffold.tracks.map((t) => {
-    const modulesYaml = t.modules.map((m) => {
-      const slug = m.slug || `module-${toSlug(m.title)}`;
-      return `      - slug: ${slug}\n        title: "${m.title}"`;
-    });
-
-    return `  - slug: ${t.slug}\n    title: "${t.title}"\n    language: ${t.language}\n    difficulty: ${t.difficulty}\n    modules:\n${modulesYaml.join('\n')}`;
+    return `  - slug: ${t.slug}\n    title: "${t.title}"\n    language: ${t.language}\n    difficulty: ${t.difficulty}`;
   });
 
-  return `---
-title: "${scaffold.title}"
-description: "${scaffold.description}"
-difficulty: ${scaffold.difficulty}
-tags: [${scaffold.tags.map((t) => `"${t}"`).join(', ')}]
-order: ${scaffold.order}
-tracks:
-${tracksYaml.join('\n')}
----
-
-# ${scaffold.title}
-
-${scaffold.description}
-
-## Overview
-
-<!-- Add system overview here -->
-
-## Prerequisites
-
-<!-- List prerequisite knowledge -->
-
-## Learning Objectives
-
-<!-- List what learners will achieve -->
-`;
+  return `---\ntitle: "${scaffold.title}"\ndescription: "${scaffold.description}"\ndifficulty: ${scaffold.difficulty}\ntags: [${scaffold.tags.map((t) => `"${t}"`).join(', ')}]\norder: ${scaffold.order}\ntracks:\n${tracksYaml.join('\n')}\n---\n\n# ${scaffold.title}\n\n${scaffold.description}\n\n## Overview\n\n<!-- Add system overview here -->\n\n## Prerequisites\n\n<!-- List prerequisite knowledge -->\n\n## Learning Objectives\n\n<!-- List what learners will achieve -->\n`;
 }
 
 // ─── Lesson Frontmatter + Test Generator ──────────────────────────
 
 /**
  * Generate a lesson's lesson.md with proper frontmatter and content.
- * Creates flat-format lessons (no module field).
+ * Includes lesson_type for the user_progress DB.
  */
 function generateLessonFrontmatter(lesson: LessonScaffold): string {
-  return `---
-title: "${lesson.title}"
-description: "${lesson.description}"
-order: ${lesson.order}
-difficulty: ${lesson.difficulty || 'Intermediate'}
-estimated_time: "${lesson.estimated_time || '30 minutes'}"
-knowledge_refs: [${lesson.knowledge_refs.map((r) => `"${r}"`).join(', ')}]
-prerequisites: []
-validation:
-  - type: test-runner
-    test_file: "tests/behavior.test.ts"
-    framework: vitest
-    timeout: 120000
----
-
-# ${lesson.title}
-
-${lesson.description}
-
-## Overview
-
-<!-- Add lesson content here -->
-
-## Key Concepts
-
-<!-- List the key concepts covered in this lesson -->
-
-## Implementation
-
-<!-- Add implementation details here -->
-
-## Exercises
-
-<!-- Add exercises here -->
-
-## Summary
-
-<!-- Summarize what was learned -->
-`;
+  return `---\ntitle: "${lesson.title}"\ndescription: "${lesson.description}"\norder: ${lesson.order}\nlesson_type: "${lesson.lesson_type || 'lesson'}"\ndifficulty: ${lesson.difficulty || 'Intermediate'}\nestimated_time: "${lesson.estimated_time || '30 minutes'}"\nknowledge_refs: [${lesson.knowledge_refs.map((r) => `"${r}"`).join(', ')}]\nprerequisites: []\nvalidation:\n  - type: test-runner\n    test_file: "tests/behavior.test.ts"\n    framework: vitest\n    timeout: 120000\n---\n\n# ${lesson.title}\n\n${lesson.description}\n\n## Overview\n\n<!-- Add lesson content here -->\n\n## Key Concepts\n\n<!-- List the key concepts covered in this lesson -->\n\n## Implementation\n\n<!-- Add implementation details here -->\n\n## Exercises\n\n<!-- Add exercises here -->\n\n## Summary\n\n<!-- Summarize what was learned -->\n`;
 }
 
 /**
@@ -167,24 +131,7 @@ function generateLessonTestFile(lesson: LessonScaffold): string {
   const testName = lesson.title.replace(/[^a-zA-Z0-9\s]/g, '').trim();
   const testDescription = `should have required project files for ${testName.toLowerCase()}`;
 
-  return `import { describe, it, expect, fileExists, readJson, expectBuildSucceeds } from '@100xsystems/test-suite-typescript';
-
-describe('${testName}', () => {
-  it('${testDescription}', () => {
-    expect(fileExists('package.json')).toBe(true);
-    expect(fileExists('tsconfig.json')).toBe(true);
-  });
-
-  it('has valid package.json with build script', () => {
-    const pkg = readJson('package.json');
-    expect(pkg.scripts?.build).toBeDefined();
-  });
-
-  it('builds successfully', () => {
-    expectBuildSucceeds();
-  });
-});
-`;
+  return `import { describe, it, expect, fileExists, readJson, expectBuildSucceeds } from '@100xsystems/test-suite-typescript';\n\ndescribe('${testName}', () => {\n  it('${testDescription}', () => {\n    expect(fileExists('package.json')).toBe(true);\n    expect(fileExists('tsconfig.json')).toBe(true);\n  });\n\n  it('has valid package.json with build script', () => {\n    const pkg = readJson('package.json');\n    expect(pkg.scripts?.build).toBeDefined();\n  });\n\n  it('builds successfully', () => {\n    expectBuildSucceeds();\n  });\n});\n`;
 }
 
 
@@ -207,7 +154,7 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
   // Create system directory
   fs.mkdirSync(systemDir, { recursive: true });
 
-  // Write index.md
+  // Write system index.md
   const indexContent = generateSystemIndexMd(scaffold);
   fs.writeFileSync(path.join(systemDir, 'index.md'), indexContent);
   filesCreated.push(path.join(systemDir, 'index.md'));
@@ -216,29 +163,42 @@ export function initSystem(scaffold: SystemScaffold): ContributeResult {
   for (const track of scaffold.tracks) {
     const trackDir = path.join(systemDir, track.slug);
     fs.mkdirSync(trackDir, { recursive: true });
-    filesCreated.push(trackDir + '/');      for (const lesson of track.modules.flatMap(m => m.lessons)) {
-        const lessonFolderName = `lesson-${toSlug(lesson.title)}`;
-        const lessonDir = path.join(trackDir, lessonFolderName);
-        fs.mkdirSync(lessonDir, { recursive: true });
-        filesCreated.push(lessonDir + '/');
+    filesCreated.push(trackDir + '/');
 
-        // Create tests/ subdirectory
-        const testsDir = path.join(lessonDir, 'tests');
-        fs.mkdirSync(testsDir, { recursive: true });
-        filesCreated.push(testsDir + '/');
+    const lessonsInTrack: Array<{ slug: string; title: string; lesson_type: string }> = [];
 
-        // Write lesson.md
-        const lessonContent = generateLessonFrontmatter(lesson);
-        const lessonPath = path.join(lessonDir, 'lesson.md');
-        fs.writeFileSync(lessonPath, lessonContent);
-        filesCreated.push(lessonPath);
+    for (const lesson of track.modules.flatMap(m => m.lessons)) {
+      const num = nextLessonNumber(trackDir);
+      const slugBase = `lesson-${toSlug(lesson.title)}`;
+      const lessonFolderName = `${String(num).padStart(2, '0')}-${slugBase}`;
+      const lessonDir = path.join(trackDir, lessonFolderName);
+      fs.mkdirSync(lessonDir, { recursive: true });
+      filesCreated.push(lessonDir + '/');
 
-        // Write tests/behavior.test.ts
-        const testContent = generateLessonTestFile(lesson);
-        const testPath = path.join(testsDir, 'behavior.test.ts');
-        fs.writeFileSync(testPath, testContent);
-        filesCreated.push(testPath);
-      }
+      // Create tests/ subdirectory
+      const testsDir = path.join(lessonDir, 'tests');
+      fs.mkdirSync(testsDir, { recursive: true });
+      filesCreated.push(testsDir + '/');
+
+      // Write lesson.md
+      const lessonContent = generateLessonFrontmatter(lesson);
+      const lessonPath = path.join(lessonDir, 'lesson.md');
+      fs.writeFileSync(lessonPath, lessonContent);
+      filesCreated.push(lessonPath);
+
+      // Write tests/behavior.test.ts
+      const testContent = generateLessonTestFile(lesson);
+      const testPath = path.join(testsDir, 'behavior.test.ts');
+      fs.writeFileSync(testPath, testContent);
+      filesCreated.push(testPath);
+
+      lessonsInTrack.push({ slug: slugBase, title: lesson.title, lesson_type: lesson.lesson_type || 'lesson' });
+    }
+
+    // Write track index.md
+    const trackIndexContent = generateTrackIndexMd(lessonsInTrack);
+    fs.writeFileSync(path.join(trackDir, 'index.md'), trackIndexContent);
+    filesCreated.push(path.join(trackDir, 'index.md'));
   }
 
   return { systemDir, filesCreated };
@@ -268,17 +228,19 @@ export function addTrack(
   fs.mkdirSync(trackDir, { recursive: true });
   filesCreated.push(trackDir + '/');
 
-  // Create a default first lesson directly under track root (flat structure)
+  // Create a default first lesson with NN- prefix
   const lesson: LessonScaffold = {
     title: `Introduction to ${trackTitle}`,
     order: 1,
     description: `Get started with ${trackTitle} for ${systemSlug}.`,
     estimated_time: '30 minutes',
+    lesson_type: 'lesson',
     knowledge_refs: [],
     content: '',
   };
 
-  const lessonFolderName = 'lesson-introduction';
+  const num = nextLessonNumber(trackDir);
+  const lessonFolderName = `${String(num).padStart(2, '0')}-lesson-introduction`;
   const lessonDir = path.join(trackDir, lessonFolderName);
   fs.mkdirSync(lessonDir, { recursive: true });
   filesCreated.push(lessonDir + '/');
@@ -298,7 +260,14 @@ export function addTrack(
   fs.writeFileSync(testPath, testContent);
   filesCreated.push(testPath);
 
-  // Update index.md tracks list (no modules field anymore)
+  // Write track index.md
+  const trackIndexContent = generateTrackIndexMd([
+    { slug: 'lesson-introduction', title: lesson.title, lesson_type: 'lesson' },
+  ]);
+  fs.writeFileSync(path.join(trackDir, 'index.md'), trackIndexContent);
+  filesCreated.push(path.join(trackDir, 'index.md'));
+
+  // Update system index.md tracks list
   const indexMdPath = path.join(systemsDir, systemSlug, 'index.md');
   if (fs.existsSync(indexMdPath)) {
     let indexContent = fs.readFileSync(indexMdPath, 'utf-8');
@@ -314,7 +283,7 @@ export function addTrack(
   return { systemDir: trackDir, filesCreated, trackSlug };
 }
 
-// ─── Add Lesson to Existing Track — Folder-based with tests/ ────────
+// ─── Add Lesson to Existing Track — Numbered folder with tests/ ─────
 
 export function addLesson(
   systemSlug: string,
@@ -334,8 +303,10 @@ export function addLesson(
 
   const filesCreated: string[] = [];
 
-  // Create flat lesson structure directly under track root (no modules)
-  const lessonFolderName = `lesson-${toSlug(lesson.title)}`;
+  // Create numbered lesson folder
+  const num = nextLessonNumber(trackDir);
+  const slugBase = `lesson-${toSlug(lesson.title)}`;
+  const lessonFolderName = `${String(num).padStart(2, '0')}-${slugBase}`;
   const lessonDir = path.join(trackDir, lessonFolderName);
   fs.mkdirSync(lessonDir, { recursive: true });
   filesCreated.push(lessonDir + '/');
@@ -356,6 +327,19 @@ export function addLesson(
   const testPath = path.join(testsDir, 'behavior.test.ts');
   fs.writeFileSync(testPath, testContent);
   filesCreated.push(testPath);
+
+  // Update track index.md with new lesson entry
+  const trackIndexPath = path.join(trackDir, 'index.md');
+  if (fs.existsSync(trackIndexPath)) {
+    const lessonEntry = `  - slug: "${slugBase}"\n    title: "${lesson.title}"\n    lesson_type: "${lesson.lesson_type || 'lesson'}"`;
+    let indexContent = fs.readFileSync(trackIndexPath, 'utf-8');
+    indexContent = indexContent.replace(
+      /lessons:\n/,
+      `lessons:\n${lessonEntry}\n`,
+    );
+    fs.writeFileSync(trackIndexPath, indexContent);
+    filesCreated.push(trackIndexPath + ' (updated)');
+  }
 
   return { systemDir: lessonDir, filesCreated };
 }

@@ -31,6 +31,7 @@ export interface LessonMeta {
   track: string;
   module: string;
   pathSegments: string[];
+  lessonType?: string;
   estimatedTime?: string;
   difficulty?: string;
   knowledgeRefs?: string[];
@@ -97,17 +98,23 @@ export function systemHasTracks(systemSlug: string): boolean {
   return getSystemTracks(systemSlug).length > 0;
 }
 
-// ─── Lesson Reading (Flat + Module-based) ───────────────────────────
+// ─── Lesson Reading (Flat — numbered folders with lesson.md) ────────
 
 /**
- * Get lessons directly from a track directory (flat structure, no modules).
- * This is the NEW preferred structure:
+ * Get lessons directly from a track directory (flat structure).
+ * Each lesson is a numbered folder (e.g. 01-lesson-intro/lesson.md)
+ * with lesson_type in frontmatter.
+ *
+ * Structure:
  *   track-{lang}/
- *     lesson-name/
+ *     index.md              (optional — ordered lesson listing)
+ *     01-lesson-name/
  *       lesson.md
  *       tests/
- *     quiz-name.md
- *     challenge-name.md
+ *     02-quiz-name/
+ *       lesson.md
+ *     03-challenge-name/
+ *       lesson.md
  */
 export function getTrackFlatLessons(systemSlug: string, trackSlug: string): LessonMeta[] {
   const lessons: LessonMeta[] = [];
@@ -121,28 +128,17 @@ export function getTrackFlatLessons(systemSlug: string, trackSlug: string): Less
       if (entry.name.startsWith('.')) continue;
       if (entry.name === 'index.md') continue;
 
-      let mdPath: string | null = null;
-      let slug = '';
+      // Only folder-based lessons: lesson-name/lesson.md
+      if (!entry.isDirectory()) continue;
 
-      if (entry.isDirectory()) {
-        // Folder-based lesson: lesson-name/lesson.md
-        const lessonMdPath = path.join(trackDir, entry.name, 'lesson.md');
-        if (fs.existsSync(lessonMdPath)) {
-          mdPath = lessonMdPath;
-          slug = fileToSlug(entry.name);
-        }
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        // Flat .md file: lesson-name.md or quiz.md, challenge.md
-        mdPath = path.join(trackDir, entry.name);
-        slug = fileToSlug(entry.name);
-      }
-
-      if (!mdPath) continue;
+      const lessonMdPath = path.join(trackDir, entry.name, 'lesson.md');
+      if (!fs.existsSync(lessonMdPath)) continue;
 
       try {
-        const raw = fs.readFileSync(mdPath, 'utf-8');
+        const raw = fs.readFileSync(lessonMdPath, 'utf-8');
         const { data, content } = parseFrontmatter(raw);
         const fm = data as any;
+        const slug = fileToSlug(entry.name);
         const order = getOrderFromFile(entry.name, fm.order);
         lessons.push({
           slug,
@@ -154,6 +150,7 @@ export function getTrackFlatLessons(systemSlug: string, trackSlug: string): Less
           track: trackSlug,
           module: '',
           pathSegments: [trackSlug, slug],
+          lessonType: fm.lesson_type || 'lesson',
           estimatedTime: fm.estimated_time,
           difficulty: fm.difficulty,
           knowledgeRefs: fm.knowledge_refs,
@@ -252,6 +249,7 @@ export function getModuleLessons(systemSlug: string, trackSlug: string, moduleSl
           track: trackSlug,
           module: moduleSlug,
           pathSegments: [trackSlug, moduleSlug, slug],
+          lessonType: fm.lesson_type || 'lesson',
           estimatedTime: fm.estimated_time,
           difficulty: fm.difficulty,
           knowledgeRefs: fm.knowledge_refs,
