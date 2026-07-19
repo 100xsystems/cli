@@ -58,6 +58,8 @@ export default function Orchestrator() {
     { label: '  doctor           — Check dev environment', value: 'doctor' },
     { label: '  validate         — Check implementation against spec', value: 'validate' },
     { label: '  solution         — Copy lesson solution into project', value: 'solution' },
+    { label: '  audit-solutions   — Generate solution manifest from tests', value: 'audit-solutions' },
+    { label: '  verify-solutions  — Cumulative verify all solutions', value: 'verify-solutions' },
     { label: '  progress         — Show per-lesson progress', value: 'progress' },
     { label: '  submit           — Submit for review', value: 'submit' },
     { label: '  list             — Quick system listing', value: 'list' },
