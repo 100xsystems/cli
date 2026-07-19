@@ -18,7 +18,7 @@ import path from 'path';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import { getAllSystems, systemExists, getSystemMeta } from '../reader/system-reader.js';
-import { getSystemTracks, getTrackModules } from '../reader/lesson-reader.js';
+import { getSystemTracks, getTrackModules, getTrackFlatLessons } from '../reader/lesson-reader.js';
 import { API_BASE_URL } from '../config.js';
 import { syncSystemFromRegistry, fetchRegistry } from '../reader/index.js';
 import { scaffoldProject } from '../scaffold/index.js';
@@ -318,8 +318,12 @@ async function doScaffold(
       const auth = await ensureAuthenticated();
       if (auth.token) {
         // Get the first lesson of the selected track
-        const modules = getTrackModules(systemSlug, trackSlug);
-        const allLessons = modules.flatMap(m => m.lessons);
+        // Try flat lessons first, fall back to module-based
+        let allLessons = getTrackFlatLessons(systemSlug, trackSlug);
+        if (allLessons.length === 0) {
+          const modules = getTrackModules(systemSlug, trackSlug);
+          allLessons = modules.flatMap(m => m.lessons);
+        }
         const firstLessonSlug = allLessons[0]?.slug || 'lesson-intro-and-setup';
 
         await fetch(`${API_BASE_URL}/api/v1/user_progress`, {

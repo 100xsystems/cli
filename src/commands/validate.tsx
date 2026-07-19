@@ -1,18 +1,20 @@
 /**
  * ## Validate Command
  *
- * Automatically validates the current lesson from 100xsystems.json progress.
- * No interactive lesson picker — detects current lesson and runs validation
- * immediately. On success, advances progress to the next lesson.
+ * Interactive lesson picker that shows all lessons in sequence with status:
+ *   ✅ Completed  — lesson was validated successfully
+ *   ▶ Current     — next lesson to validate (auto-selected)
+ *   🔒 Locked     — previous lesson not yet validated
  *
- * Flow:
- *   loading → validating → done
+ * The user selects a lesson and validation runs for that lesson.
+ * On success, progress advances to the next lesson.
  *
  * @packageDocumentation
  */
 
 import React, { useState, useEffect } from 'react';
 import { Box, Text } from 'ink';
+import SelectInput from '../ui/SelectInput.js';
 import { ValidationReport } from '../ui/index.js';
 import zod from 'zod';
 import fs from 'fs';
@@ -20,7 +22,8 @@ import path from 'path';
 import { readProjectConfig, PROJECT_CONFIG } from '../scaffold/index.js';
 import { runValidation } from '../actions/validate.js';
 import type { ValidationResult } from '../actions/validate.js';
-import { getSystemTracks, getTrackModules } from '../reader/lesson-reader.js';
+import { getSystemTracks, getTrackFlatLessons, getTrackModules } from '../reader/lesson-reader.js';
+import type { LessonMeta } from '../reader/lesson-reader.js';
 import { ensureAuthenticated } from '../auth/index.js';
 import { API_BASE_URL } from '../config.js';
 
@@ -34,6 +37,7 @@ type Props = {
 
 type ValidatePhase =
   | { name: 'loading' }
+  | { name: 'pick-lesson'; config: Record<string, any>; lessons: LessonMeta[]; completedSlugs: Set<string>; currentSlug: string }
   | { name: 'validating'; config: Record<string, any>; lessonSlug: string; lessonTitle: string }
   | { name: 'done'; config: Record<string, any>; results: ValidationResult[]; lessonSlug: string; lessonTitle: string; advanced: boolean }
   | { name: 'error'; message: string };
@@ -52,19 +56,15 @@ export default function Validate(_props: Props) {
     // Find the next lesson after this one
     const trackSlug = config.track || '';
     const sysSlug = (config.system as string) || '';
-    const tracks = getSystemTracks(sysSlug);
-    const track = tracks.find(t => t.slug === trackSlug) || tracks[0];
+    let allLessons = getTrackFlatLessons(sysSlug, trackSlug);
+    if (allLessons.length === 0) {
+      const modules = getTrackModules(sysSlug, trackSlug);
+      allLessons = modules.flatMap(m => m.lessons);
+    }
     let nextLesson = '';
-    if (track) {
-      const modules = getTrackModules(sysSlug, track.slug);
-      const allLessons = modules.flatMap(m => m.lessons);
-      const currentIdx = allLessons.findIndex(l => l.slug === slug);
-      if (currentIdx >= 0 && currentIdx < allLessons.length - 1) {
-        nextLesson = allLessons[currentIdx + 1].slug;
-      } else {
-        // Last lesson — mark completed, no next
-        nextLesson = '';
-      }
+    const currentIdx = allLessons.findIndex(l => l.slug === slug);
+    if (currentIdx >= 0 && currentIdx < allLessons.length - 1) {
+      nextLesson = allLessons[currentIdx + 1].slug;
     }
 
     // Write updated config back to 100xsystems.json
@@ -85,40 +85,35 @@ export default function Validate(_props: Props) {
       return;
     }
 
-    // Auto-detect current lesson from progress
-    const slug = (config.system as string) || '';
+    const sysSlug = (config.system as string) || '';
     const trackSlug = (config.track as string) || '';
     const progress = config.progress || { completedLessons: [], currentLesson: '' };
     const completed: string[] = progress.completedLessons || [];
-    const currentLesson: string = progress.currentLesson || '';
 
-    const tracks = getSystemTracks(slug);
-    const track = tracks.find(t => t.slug === trackSlug) || tracks[0];
-
-    if (!track) {
-      setPhase({ name: 'error', message: `No track found for this project. Ensure ${PROJECT_CONFIG} has a valid track field.` });
-      return;
+    // Get lessons — try flat first, fall back to module-based
+    let allLessons = getTrackFlatLessons(sysSlug, trackSlug);
+    if (allLessons.length === 0) {
+      const modules = getTrackModules(sysSlug, trackSlug);
+      allLessons = modules.flatMap(m => m.lessons);
     }
-
-    const modules = getTrackModules(slug, track.slug);
-    const allLessons = modules.flatMap(m => m.lessons);
 
     if (allLessons.length === 0) {
       setPhase({ name: 'error', message: 'No lessons found in this track.' });
       return;
     }
 
-    // Determine the first lesson that hasn't been completed
-    const firstIncomplete = allLessons.find(l => !completed.includes(l.slug));
-    const effectiveCurrent = currentLesson || firstIncomplete?.slug || allLessons[0].slug;
-    const targetLesson = allLessons.find(l => l.slug === effectiveCurrent) || allLessons[0];
+    const completedSlugs = new Set(completed);
+    // The current lesson is the first one NOT in completedLessons
+    const currentLesson = allLessons.find(l => !completedSlugs.has(l.slug));
+    const currentSlug = currentLesson?.slug || allLessons[0].slug;
 
-    // Go straight to validation — no interactive picker
+    // Go to lesson picker
     setPhase({
-      name: 'validating',
+      name: 'pick-lesson',
       config,
-      lessonSlug: targetLesson.slug,
-      lessonTitle: targetLesson.title,
+      lessons: allLessons,
+      completedSlugs,
+      currentSlug,
     });
   }, []);
 
@@ -128,6 +123,62 @@ export default function Validate(_props: Props) {
     return (
       <Box flexDirection="column" paddingX={2}>
         <Text dimColor>  Validating...</Text>
+      </Box>
+    );
+  }
+
+  if (phase.name === 'pick-lesson') {
+    const { lessons, completedSlugs, currentSlug } = phase;
+    const currentIndex = lessons.findIndex(l => l.slug === currentSlug);
+
+    const items = lessons.map((lesson, idx) => {
+      const isCompleted = completedSlugs.has(lesson.slug);
+      const isCurrent = lesson.slug === currentSlug;
+      // Lessons after the current one are locked (disabled)
+      const isLocked = idx > currentIndex && !isCompleted && !isCurrent;
+
+      let label: string;
+      if (isCompleted) {
+        label = `✅ ${lesson.title}`;
+      } else if (isCurrent) {
+        label = `▶ ${lesson.title}`;
+      } else if (isLocked) {
+        label = `🔒 ${lesson.title}`;
+      } else {
+        label = `  ${lesson.title}`;
+      }
+
+      return {
+        label,
+        value: lesson.slug,
+        disabled: isLocked,
+      };
+    });
+
+    return (
+      <Box flexDirection="column" paddingX={2}>
+        <Text bold color="cyan">{'  '}📋 Select Lesson to Validate</Text>
+        <Box marginY={1} />
+        <Text dimColor>{'  '}Use arrow keys to navigate, Enter to select:</Text>
+        <Box marginY={1} />
+        <Box marginLeft={2}>
+          <SelectInput
+            items={items}
+            initialIndex={Math.max(0, currentIndex)}
+            onSelect={(item) => {
+              const lesson = lessons.find(l => l.slug === item.value);
+              setPhase({
+                name: 'validating',
+                config: phase.config,
+                lessonSlug: item.value,
+                lessonTitle: lesson?.title || item.value,
+              });
+            }}
+          />
+        </Box>
+        <Box marginTop={1}>
+          <Text dimColor>{'  '}✅ Completed  ▶ Current  🔒 Locked (previous lesson not validated)</Text>
+        </Box>
       </Box>
     );
   }
@@ -233,31 +284,31 @@ function ValidatingRunner({
         // Update progress locally
         updateProgress(phase.config, phase.lessonSlug);
         advanced = true;
+      }
 
-        // Sync validation to server
-        try {
-          const auth = await ensureAuthenticated();
-          if (auth.token) {
-            const config = phase.config;
-            const sysSlug = (config.system as string) || '';
-            const trackSlug = (config.track as string) || '';
-            await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${auth.token}`,
-              },
-              body: JSON.stringify({
-                system_slug: sysSlug,
-                track_slug: trackSlug,
-                lesson_slug: phase.lessonSlug,
-                is_validated: true,
-              }),
-            });
-          }
-        } catch {
-          console.warn('  ⚠️  Failed to sync validation to server');
+      // Sync validation result to server (both success and failure)
+      try {
+        const auth = await ensureAuthenticated();
+        if (auth.token) {
+          const config = phase.config;
+          const sysSlug = (config.system as string) || '';
+          const trackSlug = (config.track as string) || '';
+          await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${auth.token}`,
+            },
+            body: JSON.stringify({
+              system_slug: sysSlug,
+              track_slug: trackSlug,
+              lesson_slug: phase.lessonSlug,
+              is_validated: failed === 0,
+            }),
+          });
         }
+      } catch {
+        // Silently fail — validation sync is non-critical
       }
 
       setPhase({
