@@ -160,9 +160,13 @@ export class TestRunnerExecutor implements Executor {
       // ctx.projectDir as the base so npm install works correctly.
       this.resolveFileReferences(tmpDir, ctx.projectDir);
 
-      // Step 3b: Inject test-suite dependency into package.json
-      // The lesson test files import from @100xsystems/test-suite-* (which re-exports vitest),
-      // not from vitest directly. This package pulls in vitest as a dependency.
+      // Step 3b: Resolve test-suite-typescript from local filesystem
+      // @100xsystems/test-suite-typescript is NOT published on npm. It's a local package
+      // bundled with the CLI. We resolve it relative to the CLI's own location.
+      // From cli/dist/executors/test-runner.executor.js → ../../../test-suite-typescript
+      this.resolveLocalTestSuite(tmpDir);
+
+      // Step 3c: Inject test-suite dependency into package.json (only if not already resolved)
       this.ensureDependency(tmpDir, '@100xsystems/test-suite-typescript', '^0.1.1');
 
       // Step 4: Create a minimal vitest.config.ts if none exists
@@ -969,6 +973,76 @@ export class TestRunnerExecutor implements Executor {
       lines.push(`  ... and ${assertions.length - 20} more`);
     }
     return lines.join('\n');
+  }
+
+  /**
+   * Resolve the local @100xsystems/test-suite-typescript package and add it
+   * as a file: dependency. This avoids needing the package on npm.
+   *
+   * The test-suite is bundled alongside the CLI in the monorepo structure:
+   *   100xsystems/
+   *     cli/
+   *       dist/executors/test-runner.executor.js
+   *     test-suite-typescript/
+   *       package.json
+   *
+   * From the compiled JS file (cli/dist/executors/), the test-suite is at
+   * ../../../test-suite-typescript relative to the executor file itself.
+   *
+   * This is called BEFORE ensureDependency(), so if we resolve successfully,
+   * ensureDependency() will see the dep already exists and skip adding the npm version.
+   */
+  private resolveLocalTestSuite(tmpDir: string): void {
+    try {
+      // Find the CLI's own location using import.meta.url
+      // In dev mode (npm link / tsx): cli/dist/executors/test-runner.executor.js
+      // In production (npm -g): depends on install layout
+      const executorUrl = new URL(import.meta.url);
+      const executorPath = executorUrl.pathname;
+      const executorDir = path.dirname(executorPath);
+
+      // Try relative path from executor dir to test-suite
+      // cli/dist/executors/ -> ../../../test-suite-typescript
+      const possiblePaths = [
+        path.resolve(executorDir, '..', '..', '..', 'test-suite-typescript'),
+        // If CLI is installed via npm link, try absolute path from the monorepo structure
+        path.resolve(executorDir, '..', '..', '..', '..', '..', 'test-suite-typescript'),
+      ];
+
+      let testSuitePath: string | null = null;
+      for (const candidate of possiblePaths) {
+        const pkgJson = path.join(candidate, 'package.json');
+        if (fs.existsSync(pkgJson)) {
+          try {
+            const pkg = JSON.parse(fs.readFileSync(pkgJson, 'utf-8'));
+            if (pkg.name === '@100xsystems/test-suite-typescript') {
+              testSuitePath = candidate;
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      if (!testSuitePath) {
+        console.warn('[100xsystems] Could not find @100xsystems/test-suite-typescript locally');
+        return;
+      }
+
+      // Add as file: dependency to temp package.json
+      const pkgPath = path.join(tmpDir, 'package.json');
+      if (!fs.existsSync(pkgPath)) return;
+
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      if (!pkg.devDependencies) pkg.devDependencies = {};
+      pkg.devDependencies['@100xsystems/test-suite-typescript'] = `file:${testSuitePath}`;
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+      console.warn(`[100xsystems] Resolved test-suite from: ${testSuitePath}`);
+    } catch (err: any) {
+      console.warn(`[100xsystems] Failed to resolve local test-suite: ${err.message}`);
+    }
   }
 
   /**
