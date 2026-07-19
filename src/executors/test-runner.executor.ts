@@ -153,7 +153,14 @@ export class TestRunnerExecutor implements Executor {
       const testDest = path.join(tmpDir, 'test.spec.ts');
       fs.copyFileSync(testFilePath, testDest);
 
-      // Step 3: Inject test-suite dependency into package.json
+      // Step 3: Resolve file: references in package.json to absolute paths
+      // The user's package.json may have `file:../../../test-suite-typescript` references.
+      // These are relative to the original project dir, but when copied to the temp dir,
+      // the relative paths no longer resolve. We rewrite them to absolute paths using
+      // ctx.projectDir as the base so npm install works correctly.
+      this.resolveFileReferences(tmpDir, ctx.projectDir);
+
+      // Step 3b: Inject test-suite dependency into package.json
       // The lesson test files import from @100xsystems/test-suite-* (which re-exports vitest),
       // not from vitest directly. This package pulls in vitest as a dependency.
       this.ensureDependency(tmpDir, '@100xsystems/test-suite-typescript', '^0.1.1');
@@ -965,6 +972,45 @@ export class TestRunnerExecutor implements Executor {
   }
 
   /**
+   * Resolve all `file:` references in the temp package.json to absolute paths.
+   * This ensures local packages like @100xsystems/test-suite-typescript (referenced
+   * via `file:` relative to the project dir) can be found from the temp directory.
+   *
+   * @param tmpDir - The temp directory where the user's package.json was copied
+   * @param projectDir - The original project directory (used as base for resolving relative paths)
+   */
+  private resolveFileReferences(tmpDir: string, projectDir: string): void {
+    const pkgPath = path.join(tmpDir, 'package.json');
+    if (!fs.existsSync(pkgPath)) return;
+
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      let modified = false;
+
+      const resolveDeps = (deps: Record<string, string> | undefined) => {
+        if (!deps) return;
+        for (const [name, version] of Object.entries(deps)) {
+          if (typeof version === 'string' && version.startsWith('file:')) {
+            const relativePath = version.slice(5); // strip 'file:' prefix
+            const absolutePath = path.resolve(projectDir, relativePath);
+            deps[name] = `file:${absolutePath}`;
+            modified = true;
+          }
+        }
+      };
+
+      resolveDeps(pkg.dependencies);
+      resolveDeps(pkg.devDependencies);
+
+      if (modified) {
+        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      }
+    } catch {
+      // Best-effort — if we can't parse package.json, npm install will fail with a clear error
+    }
+  }
+
+  /**
    * Ensure vitest is listed as a devDependency in the temp package.json.
    */
   private ensureDependency(tmpDir: string, depName: string, version: string): void {
@@ -982,6 +1028,10 @@ export class TestRunnerExecutor implements Executor {
     try {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
       if (!pkg.devDependencies) pkg.devDependencies = {};
+      // Only add the dependency if it doesn't already exist.
+      // resolveFileReferences() already handles converting file: references to absolute paths,
+      // so if the dependency exists as a resolved file: path, we should NOT overwrite it.
+      // If the dep truly doesn't exist, fall back to the npm version as a safety net.
       if (!pkg.devDependencies[depName]) {
         pkg.devDependencies[depName] = version;
       }
