@@ -20,12 +20,10 @@ import zod from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { readProjectConfig, PROJECT_CONFIG } from '../scaffold/index.js';
-import { runValidation } from '../actions/validate.js';
+import { runValidationWithSummary } from '../actions/validate.js';
 import type { ValidationResult } from '../actions/validate.js';
 import { getSystemTracks, getTrackFlatLessons, getTrackModules } from '../reader/lesson-reader.js';
 import type { LessonMeta } from '../reader/lesson-reader.js';
-import { ensureAuthenticated } from '../auth/index.js';
-import { API_BASE_URL } from '../config.js';
 
 export const args = zod.tuple([]);
 
@@ -276,8 +274,8 @@ function ValidatingRunner({
   useEffect(() => {
     (async () => {
       const projectDir = process.cwd();
-      const results = await runValidation(projectDir, phase.config, phase.lessonSlug);
-      const failed = results.filter(r => r.status === 'fail').length;
+      const summary = await runValidationWithSummary(projectDir, phase.config, phase.lessonSlug);
+      const failed = summary.total.fail;
 
       let advanced = false;
       if (failed === 0) {
@@ -286,35 +284,13 @@ function ValidatingRunner({
         advanced = true;
       }
 
-      // Sync validation result to server (both success and failure)
-      try {
-        const auth = await ensureAuthenticated();
-        if (auth.token) {
-          const config = phase.config;
-          const sysSlug = (config.system as string) || '';
-          const trackSlug = (config.track as string) || '';
-          await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${auth.token}`,
-            },
-            body: JSON.stringify({
-              system_slug: sysSlug,
-              track_slug: trackSlug,
-              lesson_slug: phase.lessonSlug,
-              is_validated: failed === 0,
-            }),
-          });
-        }
-      } catch {
-        // Silently fail — validation sync is non-critical
-      }
+      // Server sync is handled by runValidation -> syncValidationToServer in the action layer
+      // This keeps the sync logic centralized and ensures it runs regardless of UI rendering
 
       setPhase({
         name: 'done',
         config: phase.config,
-        results,
+        results: summary.results,
         lessonSlug: phase.lessonSlug,
         lessonTitle: phase.lessonTitle,
         advanced,

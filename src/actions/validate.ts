@@ -21,6 +21,9 @@ import type { ExecutorResult } from '../executors/index.js';
 import { SYSTEMS_DIR, fetchRegistry, syncSystemFromRegistry, parseFrontmatter } from '../reader/index.js';
 import type { SpecCheck } from '../reader/index.js';
 import { getSpec } from '../reader/spec-reader.js';
+import { getTrackFlatLessons, getTrackModules } from '../reader/lesson-reader.js';
+import { ensureAuthenticated } from '../auth/index.js';
+import { API_BASE_URL } from '../config.js';
 
 // ─── Exported Types ─────────────────────────────────────────────────
 
@@ -188,7 +191,7 @@ export async function runValidationWithSummary(
   const systemSlug = (config.system as string) || '';
   const trackSlug = (config.track as string) || '';
 
-  return {
+  const summary = {
     results,
     byLevel,
     total,
@@ -197,6 +200,15 @@ export async function runValidationWithSummary(
     systemSlug,
     trackSlug,
   };
+
+  // Sync validation results to server (non-blocking, best-effort)
+  try {
+    await syncValidationToServer(config, summary);
+  } catch {
+    // Server sync failures should not block the user's validation flow
+  }
+
+  return summary;
 }
 
 // ─── Lesson Validator Integration ───────────────────────────────────
@@ -962,4 +974,94 @@ async function runSpecCheck(check: SpecCheck, projectDir: string): Promise<{ res
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ─── Server Sync ────────────────────────────────────────────────────
+
+/**
+ * Sync validation results to the 100xSystems server.
+ *
+ * On SUCCESS:
+ *   1. Marks the current lesson as validated (is_validated = true)
+ *   2. Upserts the next lesson row so it exists in the DB
+ *
+ * On FAILURE:
+ *   1. Increments negative_validations for the current lesson
+ *
+ * This is best-effort — failures are logged but never block validation.
+ */
+async function syncValidationToServer(
+  config: Record<string, any>,
+  summary: ValidationSummary,
+): Promise<void> {
+  const { total, systemSlug, trackSlug, lessonSlug } = summary;
+  if (!systemSlug || !trackSlug || !lessonSlug) return;
+
+  // Get auth token
+  let auth: { token: string; user: string };
+  try {
+    auth = await ensureAuthenticated();
+  } catch {
+    console.warn('  ⚠️  Skipping server sync — not authenticated');
+    return;
+  }
+
+  if (!auth.token) return;
+
+  const isSuccess = total.fail === 0;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${auth.token}`,
+  };
+
+  // 1. Sync the current lesson validation status
+  try {
+    const validateRes = await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        system_slug: systemSlug,
+        track_slug: trackSlug,
+        lesson_slug: lessonSlug,
+        is_validated: isSuccess,
+      }),
+    });
+    if (!validateRes.ok) {
+      console.warn(`  ⚠️  Server returned ${validateRes.status} for validation sync`);
+    }
+  } catch (err: any) {
+    console.warn(`  ⚠️  Failed to sync validation to server: ${err.message}`);
+  }
+
+  // 2. On success: upsert the next lesson row so it exists in the DB
+  if (isSuccess) {
+    try {
+      // Find the next lesson
+      let allLessons = getTrackFlatLessons(systemSlug, trackSlug);
+      if (allLessons.length === 0) {
+        const modules = getTrackModules(systemSlug, trackSlug);
+        allLessons = modules.flatMap(m => m.lessons);
+      }
+
+      const currentIdx = allLessons.findIndex(l => l.slug === lessonSlug);
+      if (currentIdx >= 0 && currentIdx < allLessons.length - 1) {
+        const nextLesson = allLessons[currentIdx + 1];
+        const nextRes = await fetch(`${API_BASE_URL}/api/v1/user_progress`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            system_slug: systemSlug,
+            track_slug: trackSlug,
+            lesson_slug: nextLesson.slug,
+            lesson_type: nextLesson.lessonType || 'lesson',
+          }),
+        });
+        if (!nextRes.ok) {
+          console.warn(`  ⚠️  Server returned ${nextRes.status} for next lesson upsert`);
+        }
+      }
+    } catch (err: any) {
+      console.warn(`  ⚠️  Failed to upsert next lesson: ${err.message}`);
+    }
+  }
 }
