@@ -57,6 +57,7 @@ export default function Orchestrator() {
     { label: '  init <system>    — Scaffold a new project', value: 'init' },
     { label: '  doctor           — Check dev environment', value: 'doctor' },
     { label: '  validate         — Check implementation against spec', value: 'validate' },
+    { label: '  solution         — Copy lesson solution into project', value: 'solution' },
     { label: '  progress         — Show per-lesson progress', value: 'progress' },
     { label: '  submit           — Submit for review', value: 'submit' },
     { label: '  list             — Quick system listing', value: 'list' },
